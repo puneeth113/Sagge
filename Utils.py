@@ -29,8 +29,8 @@ def hide_default_sidebar_nav():
 PAGES = [
     {"path": "Home.py", "label": "Home", "icon": "🗂️"},
     {"path": "pages/1_Long_Absence_Tracker.py", "label": "Long Absence Tracker", "icon": "📅"},
-    {"path": "pages/2 incentive validator.py", "label": "Incentive Validator", "icon": "💰"},
-    {"path": "pages/3_payroll calculator.py", "label": "Payroll Calculator", "icon": "🧾"},
+    {"path": "pages/2_Incentive_Validator.py", "label": "Incentive Validator", "icon": "💰"},
+    {"path": "pages/3_Payroll_Calculator.py", "label": "Payroll Calculator", "icon": "🧾"},
     {"path": "pages/4_Employee_Database.py", "label": "Employee Database", "icon": "👥"},
     {"path": "pages/5_Paysheet_Operations.py", "label": "Paysheet Operations", "icon": "📋"},
 ]
