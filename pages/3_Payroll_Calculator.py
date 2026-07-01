@@ -33,37 +33,38 @@ if employee_type == "Full-Time":
         df = st.session_state["fulltime_data"]
         
         st.markdown("#### Map Columns")
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
         with col1:
-            basic_col = st.selectbox("Basic Column", options=df.columns)
+            basic_col = st.selectbox("Basic Column", options=df.columns, key="basic_col")
         with col2:
-            hra_col = st.selectbox("HRA Column (optional)", options=["-"] + list(df.columns))
+            hra_col = st.selectbox("HRA Column (optional)", options=["-"] + list(df.columns), key="hra_col")
         with col3:
-            other_col = st.selectbox("Other Allowances (optional)", options=["-"] + list(df.columns))
-        with col4:
-            st.write("")
+            other_col = st.selectbox("Other Allowances (optional)", options=["-"] + list(df.columns), key="other_col")
         
         st.markdown("#### Configure Statutory Rates & Thresholds")
         
         st.markdown("**PF Settings**")
         pf_col1, pf_col2, pf_col3 = st.columns(3)
         with pf_col1:
-            pf_emp_pct = st.number_input("PF Employee %", value=12.0, min_value=0.0, max_value=50.0)
+            pf_emp_pct = st.number_input("PF Employee %", value=12.0, min_value=0.0, max_value=50.0, key="pf_emp")
         with pf_col2:
-            pf_emp_pct = st.number_input("PF Employer %", value=12.0, min_value=0.0, max_value=50.0)
+            pf_employer_pct = st.number_input("PF Employer %", value=12.0, min_value=0.0, max_value=50.0, key="pf_emp_rate")
         with pf_col3:
-            pf_wage_cap = st.number_input("PF Wage Cap (₹)", value=15000.0, min_value=0.0)
+            pf_wage_cap = st.number_input("PF Wage Cap (₹)", value=15000.0, min_value=0.0, key="pf_cap")
         
         st.markdown("**ESIC Settings**")
         esic_col1, esic_col2, esic_col3 = st.columns(3)
         with esic_col1:
-            esic_threshold = st.number_input("ESIC Threshold (₹)", value=21000.0, min_value=0.0)
+            esic_threshold = st.number_input("ESIC Threshold (₹)", value=21000.0, min_value=0.0, key="esic_thresh")
         with esic_col2:
-            esic_emp_pct = st.number_input("ESIC Employee %", value=0.75, min_value=0.0, max_value=5.0)
+            esic_emp_pct = st.number_input("ESIC Employee %", value=0.75, min_value=0.0, max_value=5.0, key="esic_emp")
         with esic_col3:
-            esic_emp_pct = st.number_input("ESIC Employer %", value=3.25, min_value=0.0, max_value=10.0)
+            esic_employer_pct = st.number_input("ESIC Employer %", value=3.25, min_value=0.0, max_value=10.0, key="esic_emp_rate")
         
-        if st.button("Calculate Payroll"):
+        st.markdown("**Apply PF Wage Cap**")
+        apply_pf_cap = st.checkbox("Apply ₹15,000 wage cap for PF", value=True)
+        
+        if st.button("Calculate Payroll", key="calc_fulltime"):
             try:
                 result = compute_fulltime_payroll(
                     df,
@@ -71,11 +72,12 @@ if employee_type == "Full-Time":
                     hra_col=None if hra_col == "-" else hra_col,
                     other_allow_col=None if other_col == "-" else other_col,
                     pf_wage_cap=pf_wage_cap,
+                    apply_pf_cap=apply_pf_cap,
                     pf_employee_pct=pf_emp_pct,
-                    pf_employer_pct=pf_emp_pct,
+                    pf_employer_pct=pf_employer_pct,
                     esic_threshold=esic_threshold,
                     esic_employee_pct=esic_emp_pct,
-                    esic_employer_pct=esic_emp_pct,
+                    esic_employer_pct=esic_employer_pct,
                 )
                 st.session_state["payroll_result"] = result
                 st.success("✅ Payroll calculated successfully!")
@@ -89,12 +91,30 @@ if employee_type == "Full-Time":
             st.dataframe(result, use_container_width=True, height=400)
             
             # Summary
-            st.markdown("#### Cost Summary")
+            st.markdown("#### Employee Deductions Summary")
             sum_col1, sum_col2, sum_col3, sum_col4 = st.columns(4)
             sum_col1.metric("Total Gross", f"₹{result['Gross Salary'].sum():,.0f}")
-            sum_col2.metric("Total PF Cost", f"₹{(result['PF (Employee)'] + result['PF (Employer)']).sum():,.0f}")
-            sum_col3.metric("Total ESIC Cost", f"₹{(result['ESIC (Employee)'] + result['ESIC (Employer)']).sum():,.0f}")
+            sum_col2.metric("Total Employee PF", f"₹{result['PF (Employee)'].sum():,.0f}")
+            sum_col3.metric("Total Employee ESIC", f"₹{result['ESIC (Employee)'].sum():,.0f}")
             sum_col4.metric("Total Net Pay", f"₹{result['Net Pay (Employee Take-home)'].sum():,.0f}")
+            
+            st.markdown("#### Employer Cost Summary")
+            emp_col1, emp_col2, emp_col3 = st.columns(3)
+            emp_col1.metric("Total Employer PF", f"₹{result['PF (Employer)'].sum():,.0f}")
+            emp_col2.metric("Total Employer ESIC", f"₹{result['ESIC (Employer)'].sum():,.0f}")
+            emp_col3.metric("Total Employer Cost", f"₹{result['Total Employer Cost (CTC add-on)'].sum():,.0f}")
+            
+            st.markdown("#### Cost Breakdown")
+            cost_chart_data = pd.DataFrame({
+                "Employee": ["Gross Salary", "PF (Employee)", "ESIC (Employee)", "Net Pay"],
+                "Amount": [
+                    result['Gross Salary'].sum(),
+                    result['PF (Employee)'].sum(),
+                    result['ESIC (Employee)'].sum(),
+                    result['Net Pay (Employee Take-home)'].sum(),
+                ]
+            })
+            st.bar_chart(cost_chart_data.set_index('Employee'))
             
             download_button_for_df(result, "⬇️ Download Payroll", f"fulltime_payroll_{datetime.now().strftime('%Y%m%d')}.xlsx")
 
@@ -113,12 +133,16 @@ else:  # Gig/Contract
         df = st.session_state["gig_data"]
         
         st.markdown("#### Map Columns")
-        amount_col = st.selectbox("Payment Amount Column", options=df.columns)
+        amount_col = st.selectbox("Payment Amount Column", options=df.columns, key="amount_col")
         
         st.markdown("#### TDS Settings")
-        tds_pct = st.number_input("TDS % (to be added to billing)", value=1.0, min_value=0.0, max_value=50.0)
+        col1, col2 = st.columns(2)
+        with col1:
+            tds_pct = st.number_input("TDS % (to be added to billing)", value=1.0, min_value=0.0, max_value=50.0, key="tds_pct")
+        with col2:
+            st.info(f"💡 1% TDS adds: ₹{1000 * 0.01:.0f} per ₹1,000 payment")
         
-        if st.button("Calculate Billing"):
+        if st.button("Calculate Billing", key="calc_gig"):
             try:
                 result = compute_gig_worker_billing(df, amount_col, tds_pct)
                 st.session_state["gig_result"] = result
@@ -133,10 +157,21 @@ else:  # Gig/Contract
             st.dataframe(result, use_container_width=True, height=400)
             
             # Summary
-            st.markdown("#### Cost Summary")
+            st.markdown("#### Billing Summary")
             sum_col1, sum_col2, sum_col3 = st.columns(3)
             sum_col1.metric("Total Payment", f"₹{result[amount_col].sum():,.0f}")
             sum_col2.metric("Total TDS", f"₹{result['TDS Amount'].sum():,.0f}")
             sum_col3.metric("Total Billing", f"₹{result['Monthly Billing Amount'].sum():,.0f}")
+            
+            # Visualization
+            st.markdown("#### Billing Breakdown")
+            billing_chart = pd.DataFrame({
+                "Category": ["Payment", "TDS"],
+                "Amount": [
+                    result[amount_col].sum(),
+                    result['TDS Amount'].sum()
+                ]
+            })
+            st.bar_chart(billing_chart.set_index('Category'))
             
             download_button_for_df(result, "⬇️ Download Billing", f"gig_billing_{datetime.now().strftime('%Y%m%d')}.xlsx")
