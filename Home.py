@@ -34,13 +34,13 @@ with nav2:
     with st.container(border=True):
         st.markdown("##### 💰 Incentive Validator")
         st.caption("Bulk-upload branch incentive data, validate & compute incentives.")
-        st.page_link("pages/2 incentive validator.py", label="Open →", icon="💰")
+        st.page_link("pages/2_Incentive_Validator.py", label="Open →", icon="💰")
 
 with nav3:
     with st.container(border=True):
         st.markdown("##### 🧾 Payroll Calculator")
         st.caption("Compute monthly gross for full-time staff (PF/ESIC) and gig workers (TDS billing).")
-        st.page_link("pages/3_payroll calculator.py", label="Open →", icon="🧾")
+        st.page_link("pages/3_Payroll_Calculator.py", label="Open →", icon="🧾")
 
 nav4, nav5, nav6 = st.columns(3)
 
