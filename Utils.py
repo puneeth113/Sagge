@@ -167,6 +167,39 @@ def render_clear_data_button(label: str = "🔒 Clear cached data from this sess
 # 1. Long Absence Tracking
 # --------------------------------------------------------------------------
 
+def sample_attendance_muster() -> pd.DataFrame:
+    """Small example attendance muster for download, showing the expected
+    shape: employee identifier columns first (Employee ID, Employee Name,
+    Branch), followed by one column per day with attendance marks
+    (P=Present, A=Absent, WO=Weekly Off, L=Leave).
+
+    This mirrors the row/column layout the Long Absence Tracker page
+    expects — copy this shape when preparing your real muster."""
+    days = [f"Day{i}" for i in range(1, 11)]
+
+    rows = [
+        {
+            "Employee ID": "E001",
+            "Employee Name": "Ravi Kumar",
+            "Branch": "Koramangala",
+            **dict(zip(days, ["P", "P", "A", "P", "P", "WO", "P", "A", "P", "P"])),
+        },
+        {
+            "Employee ID": "E002",
+            "Employee Name": "Sita Sharma",
+            "Branch": "Koramangala",
+            **dict(zip(days, ["P", "P", "P", "P", "P", "WO", "P", "P", "P", "P"])),
+        },
+        {
+            "Employee ID": "E003",
+            "Employee Name": "Mohan Das",
+            "Branch": "Whitefield",
+            **dict(zip(days, ["A", "A", "A", "A", "A", "WO", "A", "A", "A", "A"])),
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
 def count_absences(df: pd.DataFrame, id_cols: list, absence_marker: str = "A") -> pd.DataFrame:
     """Given an attendance muster where `id_cols` identify the employee and
     all other columns are day-wise attendance marks, count how many times
