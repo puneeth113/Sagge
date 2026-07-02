@@ -43,7 +43,7 @@ st.caption("Branch HR operations toolkit — employee database, long-absence tra
            "incentive validation, and payroll (PF/ESIC/TDS) calculations.")
 
 st.markdown("#### Navigate")
-nav1, nav2, nav3 = st.columns(3)
+nav1, nav2, nav3, nav4 = st.columns(4)
 
 with nav1:
     with st.container(border=True):
@@ -62,6 +62,12 @@ with nav3:
         st.markdown("##### 🧾 Payroll Calculator")
         st.caption("Compute monthly gross for full-time staff (PF/ESIC) and gig workers (TDS billing).")
         st.page_link("pages/3_Payroll_Calculator.py", label="Open →", icon="🧾")
+
+with nav4:
+    with st.container(border=True):
+        st.markdown("##### 🏦 Gratuity & Advance")
+        st.caption("Statutory gratuity calculator, plus ERP/OIS-based paysheet lookup for salary advances.")
+        st.page_link("pages/4_Gratuity_and_Advance.py", label="Open →", icon="🏦")
 
 st.divider()
 st.subheader("📋 Employee Database")
