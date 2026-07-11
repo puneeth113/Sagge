@@ -69,6 +69,14 @@ with nav4:
         st.caption("Statutory gratuity calculator, plus ERP/OIS-based paysheet lookup for salary advances.")
         st.page_link("pages/4_Gratuity_and_Advance.py", label="Open →", icon="🏦")
 
+nav5, _, _, _ = st.columns(4)
+
+with nav5:
+    with st.container(border=True):
+        st.markdown("##### 🤱 Maternity Payment")
+        st.caption("Per-day maternity benefit calculator with automatic decrement for already-paid days.")
+        st.page_link("pages/5_Maternity_Payment.py", label="Open →", icon="🤱")
+
 st.divider()
 st.subheader("📋 Employee Database")
 st.caption("Upload your employee master sheet. The **first row is always treated as the column header**.")
