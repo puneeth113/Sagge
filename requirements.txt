@@ -2,4 +2,4 @@ xlsxwriter
 pandas
 streamlit
 openpyxl
-sqllite
+sqlite3
