@@ -20,54 +20,62 @@ METHOD
       the amount, without shifting the rest of the calculation.
 """
 
-import calendar
 from datetime import date, timedelta
 
 
 def compute_maternity_payment(
     monthly_salary: float,
     leave_start_date: date,
-    total_entitled_days: int = 182,
+    leave_end_date: date,
+    max_entitled_days: int = 182,
     already_paid_dates: set = None,
+    daily_rate_divisor: int = 30,
 ) -> dict:
-    """Returns a dict with the leave window, decrement count, a month-by-month
-    breakdown (since the daily rate differs per calendar month), and the
-    total payable amount."""
+    """
+    1. actual_days   = calendar days from leave_start_date to leave_end_date, inclusive.
+    2. capped_days   = min(actual_days, max_entitled_days) — the leave span can never
+                       be paid for more than the entitlement (182 days by default),
+                       even if the requested end date is further out.
+    3. payable_days  = capped_days minus any already-paid dates that fall inside the
+                       capped window (dates outside the window don't count — they
+                       weren't going to be paid by this calculation anyway).
+    4. daily_rate    = monthly_salary / daily_rate_divisor — a flat "per day on a
+                       monthly basis" rate (default divisor 30), not a rate that
+                       varies by how many days each specific calendar month has.
+    5. total_amount  = payable_days * daily_rate.
+    """
     already_paid_dates = already_paid_dates or set()
 
-    all_dates = [leave_start_date + timedelta(days=i) for i in range(total_entitled_days)]
-    payable_dates = [d for d in all_dates if d not in already_paid_dates]
-    decremented_days = total_entitled_days - len(payable_dates)
+    if leave_end_date < leave_start_date:
+        raise ValueError("Leave End Date must be on or after Leave Start Date.")
+    if daily_rate_divisor <= 0:
+        raise ValueError("Daily rate divisor must be greater than zero.")
 
-    by_month = {}
-    for d in payable_dates:
-        by_month.setdefault((d.year, d.month), []).append(d)
+    actual_days = (leave_end_date - leave_start_date).days + 1
+    was_capped = actual_days > max_entitled_days
+    capped_days = min(actual_days, max_entitled_days)
+    effective_end_date = leave_start_date + timedelta(days=capped_days - 1)
 
-    breakdown = []
-    total_amount = 0.0
-    for (year, month), dates_in_month in sorted(by_month.items()):
-        days_in_month = calendar.monthrange(year, month)[1]
-        daily_rate = monthly_salary / days_in_month
-        amount = daily_rate * len(dates_in_month)
-        total_amount += amount
-        breakdown.append({
-            "Year": year,
-            "Month": month,
-            "Month Name": calendar.month_name[month],
-            "Days in Month": days_in_month,
-            "Payable Days This Month": len(dates_in_month),
-            "Daily Rate (₹)": round(daily_rate, 2),
-            "Amount (₹)": round(amount, 2),
-        })
+    # Only dates that actually fall within the (possibly capped) payable window count.
+    relevant_excluded = {d for d in already_paid_dates if leave_start_date <= d <= effective_end_date}
+    decremented_days = len(relevant_excluded)
+
+    payable_days = max(capped_days - decremented_days, 0)
+
+    daily_rate = monthly_salary / daily_rate_divisor
+    total_amount = round(payable_days * daily_rate, 2)
 
     return {
         "leave_start_date": leave_start_date,
-        "leave_end_date": leave_start_date + timedelta(days=total_entitled_days - 1),
-        "total_entitled_days": total_entitled_days,
+        "leave_end_date": leave_end_date,
+        "actual_days_requested": actual_days,
+        "max_entitled_days": max_entitled_days,
+        "was_capped": was_capped,
+        "effective_end_date": effective_end_date,
         "decremented_days": decremented_days,
-        "payable_days": len(payable_dates),
-        "total_amount": round(total_amount, 2),
-        "monthly_breakdown": breakdown,
+        "payable_days": payable_days,
+        "daily_rate": round(daily_rate, 2),
+        "total_amount": total_amount,
     }
 
 
