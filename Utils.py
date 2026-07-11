@@ -33,6 +33,7 @@ PAGES = [
     {"path": "pages/3_Payroll_Calculator.py", "label": "Payroll Calculator", "icon": "🧾"},
     {"path": "pages/4_Gratuity_and_Advance.py", "label": "Gratuity & Advance", "icon": "🏦"},
     {"path": "pages/5_Maternity_Payment.py", "label": "Maternity Payment", "icon": "🤱"},
+    {"path": "pages/6_Task_Manager.py", "label": "Task Manager", "icon": "✅"},
 ]
 
 
