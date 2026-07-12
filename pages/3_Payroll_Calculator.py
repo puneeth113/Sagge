@@ -1,5 +1,4 @@
 import os
-import sys
 import importlib.util
 
 import streamlit as st
@@ -35,6 +34,7 @@ _u = _load_utils()
 render_top_nav = _u.render_top_nav
 read_any_table = _u.read_any_table
 download_button_for_df = _u.download_button_for_df
+to_excel_bytes = _u.to_excel_bytes
 compute_fulltime_payroll = _u.compute_fulltime_payroll
 compute_gig_worker_billing = _u.compute_gig_worker_billing
 solve_gross_for_net_fulltime = _u.solve_gross_for_net_fulltime
@@ -42,6 +42,12 @@ gig_inhand_to_billing = _u.gig_inhand_to_billing
 gig_billing_to_inhand = _u.gig_billing_to_inhand
 safe_error_message = _u.safe_error_message
 render_clear_data_button = _u.render_clear_data_button
+sample_fulltime_payroll_template = _u.sample_fulltime_payroll_template
+sample_gig_billing_template = _u.sample_gig_billing_template
+sample_gross_to_inhand_template = _u.sample_gross_to_inhand_template
+sample_inhand_to_gross_template = _u.sample_inhand_to_gross_template
+sample_gig_inhand_to_billing_template = _u.sample_gig_inhand_to_billing_template
+sample_gig_billing_to_inhand_template = _u.sample_gig_billing_to_inhand_template
 
 st.set_page_config(page_title="Payroll Calculator", page_icon="🧾", layout="wide")
 render_top_nav("Payroll Calculator")
@@ -58,19 +64,30 @@ with st.expander("🔒 Data handling on this page", expanded=False):
     )
     render_clear_data_button()
 
+
+def _show_error(e: Exception, context: str):
+    """ValueError messages here are hand-written to be safe and helpful to
+    show directly (e.g. 'row 5 has a non-numeric value') — only truly
+    unexpected exceptions get the generic safe_error_message treatment."""
+    if isinstance(e, ValueError):
+        st.error(str(e))
+    else:
+        st.error(safe_error_message(e, context=context))
+
+
 st.markdown("#### Select Employee Type")
 employee_type = st.radio("Employee Category", options=["Full-Time", "Gig/Contract"], horizontal=True)
 
 if employee_type == "Full-Time":
 
     # ------------------------------------------------------------------ #
-    # Quick converter: Gross <-> In-Hand (single employee, no upload needed)
+    # Quick converter: Gross <-> In-Hand
     # ------------------------------------------------------------------ #
     with st.expander("🔄 Quick Convert: Gross ⇄ In-Hand", expanded=True):
         st.caption(
-            "Convert a single employee's Gross to In-Hand (Net) or work backwards from a "
-            "desired In-Hand amount to the Gross needed to pay it. Uses the PF/ESIC rates "
-            "set below (defaults are standard rates — adjust if yours differ)."
+            "Convert Gross to In-Hand (Net) or work backwards from a desired In-Hand amount to the "
+            "Gross needed to pay it. Uses the PF/ESIC rates set below (defaults are standard rates — "
+            "adjust if yours differ)."
         )
 
         with st.expander("Advanced: customize PF/ESIC rates for this converter", expanded=False):
@@ -86,70 +103,155 @@ if employee_type == "Full-Time":
                 qc_esic_emp = st.number_input("ESIC % — Employee", min_value=0.0, value=0.75, key="qc_esic_emp")
                 qc_esic_employer = st.number_input("ESIC % — Employer", min_value=0.0, value=3.25, key="qc_esic_employer")
 
-        conv_mode = st.radio(
-            "Conversion direction",
-            ["Gross → In-Hand", "In-Hand → Gross"],
-            horizontal=True,
-            key="ft_conv_mode",
-        )
+        conv_input_mode = st.radio("Input method", ["Single Employee", "Bulk Upload"], horizontal=True, key="ft_conv_input_mode")
+        conv_mode = st.radio("Conversion direction", ["Gross → In-Hand", "In-Hand → Gross"], horizontal=True, key="ft_conv_mode")
 
-        cc1, cc2 = st.columns(2)
-        with cc1:
-            fixed_allow = st.number_input(
-                "Fixed Allowances — HRA + Other (₹, not subject to PF)",
-                min_value=0.0, value=0.0, key="ft_conv_allow",
-                help="Added on top of Basic for Gross, but excluded from PF (only Basic is PF wage). Leave at 0 to treat the whole amount as Basic.",
-            )
-
-        if conv_mode == "Gross → In-Hand":
-            with cc2:
-                gross_input = st.number_input("Gross Salary (₹)", min_value=0.0, value=25000.0, key="ft_conv_gross")
-
-            if st.button("Convert", key="ft_conv_btn_g2n"):
-                basic = max(gross_input - fixed_allow, 0)
-                df_single = pd.DataFrame([{"Basic": basic, "Other": fixed_allow}])
-                row = compute_fulltime_payroll(
-                    df_single, "Basic", None, "Other",
-                    pf_wage_cap=qc_pf_cap, apply_pf_cap=qc_apply_cap,
-                    pf_employee_pct=qc_pf_emp, pf_employer_pct=qc_pf_employer,
-                    esic_threshold=qc_esic_thresh,
-                    esic_employee_pct=qc_esic_emp, esic_employer_pct=qc_esic_employer,
-                ).iloc[0]
-
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Gross Salary", f"₹{row['Gross Salary']:,.0f}")
-                m2.metric("PF (Employee)", f"₹{row['PF (Employee)']:,.0f}")
-                m3.metric("ESIC (Employee)", f"₹{row['ESIC (Employee)']:,.0f}")
-                m4.metric("In-Hand (Net)", f"₹{row['Net Pay (Employee Take-home)']:,.0f}")
-
-        else:  # In-Hand -> Gross
-            with cc2:
-                net_input = st.number_input("Desired In-Hand / Net Pay (₹)", min_value=0.0, value=20000.0, key="ft_conv_net")
-
-            if st.button("Convert", key="ft_conv_btn_n2g"):
-                solved = solve_gross_for_net_fulltime(
-                    target_net=net_input, fixed_allowances=fixed_allow,
-                    pf_wage_cap=qc_pf_cap, apply_pf_cap=qc_apply_cap,
-                    pf_employee_pct=qc_pf_emp, pf_employer_pct=qc_pf_employer,
-                    esic_threshold=qc_esic_thresh,
-                    esic_employee_pct=qc_esic_emp, esic_employer_pct=qc_esic_employer,
+        if conv_input_mode == "Single Employee":
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                fixed_allow = st.number_input(
+                    "Fixed Allowances — HRA + Other (₹, not subject to PF)",
+                    min_value=0.0, value=0.0, key="ft_conv_allow",
+                    help="Added on top of Basic for Gross, but excluded from PF (only Basic is PF wage). Leave at 0 to treat the whole amount as Basic.",
                 )
-                row = solved["row"]
 
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Required Gross", f"₹{row['Gross Salary']:,.0f}")
-                m2.metric("PF (Employee)", f"₹{row['PF (Employee)']:,.0f}")
-                m3.metric("ESIC (Employee)", f"₹{row['ESIC (Employee)']:,.0f}")
-                m4.metric("Resulting In-Hand", f"₹{row['Net Pay (Employee Take-home)']:,.0f}")
-                st.caption(f"↳ Basic Salary component: ₹{solved['Basic']:,.0f}  |  Fixed Allowances: ₹{fixed_allow:,.0f}")
+            if conv_mode == "Gross → In-Hand":
+                with cc2:
+                    gross_input = st.number_input("Gross Salary (₹)", min_value=0.0, value=25000.0, key="ft_conv_gross")
+
+                if st.button("Convert", key="ft_conv_btn_g2n"):
+                    basic = max(gross_input - fixed_allow, 0)
+                    df_single = pd.DataFrame([{"Basic": basic, "Other": fixed_allow}])
+                    row = compute_fulltime_payroll(
+                        df_single, "Basic", None, "Other",
+                        pf_wage_cap=qc_pf_cap, apply_pf_cap=qc_apply_cap,
+                        pf_employee_pct=qc_pf_emp, pf_employer_pct=qc_pf_employer,
+                        esic_threshold=qc_esic_thresh,
+                        esic_employee_pct=qc_esic_emp, esic_employer_pct=qc_esic_employer,
+                    ).iloc[0]
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Gross Salary", f"₹{row['Gross Salary']:,.0f}")
+                    m2.metric("PF (Employee)", f"₹{row['PF (Employee)']:,.0f}")
+                    m3.metric("ESIC (Employee)", f"₹{row['ESIC (Employee)']:,.0f}")
+                    m4.metric("In-Hand (Net)", f"₹{row['Net Pay (Employee Take-home)']:,.0f}")
+
+            else:  # In-Hand -> Gross
+                with cc2:
+                    net_input = st.number_input("Desired In-Hand / Net Pay (₹)", min_value=0.0, value=20000.0, key="ft_conv_net")
+
+                if st.button("Convert", key="ft_conv_btn_n2g"):
+                    solved = solve_gross_for_net_fulltime(
+                        target_net=net_input, fixed_allowances=fixed_allow,
+                        pf_wage_cap=qc_pf_cap, apply_pf_cap=qc_apply_cap,
+                        pf_employee_pct=qc_pf_emp, pf_employer_pct=qc_pf_employer,
+                        esic_threshold=qc_esic_thresh,
+                        esic_employee_pct=qc_esic_emp, esic_employer_pct=qc_esic_employer,
+                    )
+                    row = solved["row"]
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Required Gross", f"₹{row['Gross Salary']:,.0f}")
+                    m2.metric("PF (Employee)", f"₹{row['PF (Employee)']:,.0f}")
+                    m3.metric("ESIC (Employee)", f"₹{row['ESIC (Employee)']:,.0f}")
+                    m4.metric("Resulting In-Hand", f"₹{row['Net Pay (Employee Take-home)']:,.0f}")
+                    st.caption(f"↳ Basic Salary component: ₹{solved['Basic']:,.0f}  |  Fixed Allowances: ₹{fixed_allow:,.0f}")
+
+        else:  # Bulk Upload conversion
+            if conv_mode == "Gross → In-Hand":
+                st.caption("Columns required: **Employee ID, Name, Gross Salary**. Optional: **Fixed Allowances** (HRA+Other, excluded from PF).")
+                sample = sample_gross_to_inhand_template()
+                st.dataframe(sample, use_container_width=True)
+                st.download_button("⬇️ Download sample template", data=to_excel_bytes({"Template": sample}),
+                                    file_name="gross_to_inhand_template.xlsx", key="dl_g2n_template")
+
+                uploaded_conv = st.file_uploader("Upload sheet (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="ft_bulk_g2n")
+                if uploaded_conv:
+                    conv_df = read_any_table(uploaded_conv)
+                    st.dataframe(conv_df, use_container_width=True)
+                    if "Gross Salary" not in conv_df.columns:
+                        st.error("Missing required column: 'Gross Salary'")
+                    elif st.button("Convert all rows", key="btn_bulk_g2n"):
+                        try:
+                            work = conv_df.copy()
+                            has_allow = "Fixed Allowances" in work.columns
+                            allow_col_data = work["Fixed Allowances"] if has_allow else 0
+                            calc_df = pd.DataFrame({
+                                "Basic": (pd.to_numeric(work["Gross Salary"], errors="coerce")
+                                          - (pd.to_numeric(work["Fixed Allowances"], errors="coerce") if has_allow else 0)),
+                                "Other": (pd.to_numeric(work["Fixed Allowances"], errors="coerce") if has_allow else 0),
+                            })
+                            result = compute_fulltime_payroll(
+                                calc_df, "Basic", None, "Other",
+                                pf_wage_cap=qc_pf_cap, apply_pf_cap=qc_apply_cap,
+                                pf_employee_pct=qc_pf_emp, pf_employer_pct=qc_pf_employer,
+                                esic_threshold=qc_esic_thresh,
+                                esic_employee_pct=qc_esic_emp, esic_employer_pct=qc_esic_employer,
+                            )
+                            out = work.copy()
+                            out["Gross Salary"] = result["Gross Salary"]
+                            out["PF (Employee)"] = result["PF (Employee)"]
+                            out["ESIC (Employee)"] = result["ESIC (Employee)"]
+                            out["In-Hand (Net)"] = result["Net Pay (Employee Take-home)"]
+                            st.success(f"Converted {len(out)} row(s).")
+                            st.dataframe(out, use_container_width=True, height=400)
+                            download_button_for_df(out, "⬇️ Download results", "bulk_gross_to_inhand_results.xlsx")
+                        except Exception as e:
+                            _show_error(e, "converting Gross to In-Hand")
+
+            else:  # In-Hand -> Gross bulk
+                st.caption("Columns required: **Employee ID, Name, Desired In-Hand**. Optional: **Fixed Allowances** (HRA+Other, excluded from PF).")
+                sample = sample_inhand_to_gross_template()
+                st.dataframe(sample, use_container_width=True)
+                st.download_button("⬇️ Download sample template", data=to_excel_bytes({"Template": sample}),
+                                    file_name="inhand_to_gross_template.xlsx", key="dl_n2g_template")
+
+                uploaded_conv2 = st.file_uploader("Upload sheet (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="ft_bulk_n2g")
+                if uploaded_conv2:
+                    conv_df2 = read_any_table(uploaded_conv2)
+                    st.dataframe(conv_df2, use_container_width=True)
+                    if "Desired In-Hand" not in conv_df2.columns:
+                        st.error("Missing required column: 'Desired In-Hand'")
+                    elif st.button("Convert all rows", key="btn_bulk_n2g"):
+                        try:
+                            work = conv_df2.copy()
+                            has_allow = "Fixed Allowances" in work.columns
+                            required_gross, required_basic, resulting_net = [], [], []
+                            for _, row in work.iterrows():
+                                target = float(str(row["Desired In-Hand"]).replace("₹", "").replace(",", ""))
+                                allow = float(str(row["Fixed Allowances"]).replace("₹", "").replace(",", "")) if has_allow and pd.notna(row.get("Fixed Allowances")) else 0.0
+                                solved = solve_gross_for_net_fulltime(
+                                    target_net=target, fixed_allowances=allow,
+                                    pf_wage_cap=qc_pf_cap, apply_pf_cap=qc_apply_cap,
+                                    pf_employee_pct=qc_pf_emp, pf_employer_pct=qc_pf_employer,
+                                    esic_threshold=qc_esic_thresh,
+                                    esic_employee_pct=qc_esic_emp, esic_employer_pct=qc_esic_employer,
+                                )
+                                required_gross.append(solved["row"]["Gross Salary"])
+                                required_basic.append(solved["Basic"])
+                                resulting_net.append(solved["row"]["Net Pay (Employee Take-home)"])
+                            out = work.copy()
+                            out["Required Basic"] = required_basic
+                            out["Required Gross"] = required_gross
+                            out["Resulting In-Hand"] = resulting_net
+                            st.success(f"Converted {len(out)} row(s).")
+                            st.dataframe(out, use_container_width=True, height=400)
+                            download_button_for_df(out, "⬇️ Download results", "bulk_inhand_to_gross_results.xlsx")
+                        except Exception as e:
+                            _show_error(e, "converting In-Hand to Gross")
 
     st.divider()
 
     # ------------------------------------------------------------------ #
-    # Bulk upload payroll calculation (unchanged from your version)
+    # Bulk upload payroll calculation
     # ------------------------------------------------------------------ #
     st.markdown("#### Upload Full-Time Employee Data")
-    st.caption("Columns: Employee ID, Name, Basic, HRA (optional), Other Allowances (optional)")
+    st.caption("Columns required: **Employee ID, Name, Basic**. Optional: **HRA, Other Allowances**.")
+
+    ft_sample = sample_fulltime_payroll_template()
+    st.dataframe(ft_sample, use_container_width=True)
+    st.download_button("⬇️ Download sample template", data=to_excel_bytes({"Template": ft_sample}),
+                        file_name="fulltime_payroll_template.xlsx", key="dl_ft_payroll_template")
 
     uploaded = st.file_uploader("Upload Full-Time Employee Data (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="fulltime")
 
@@ -211,10 +313,17 @@ if employee_type == "Full-Time":
                 st.session_state["payroll_result"] = result
                 st.success("✅ Payroll calculated successfully!")
             except Exception as e:
-                st.error(safe_error_message(e, context="calculating payroll"))
+                _show_error(e, "calculating payroll")
 
         if "payroll_result" in st.session_state:
             result = st.session_state["payroll_result"]
+
+            if result["Gross Salary"].isna().any():
+                missing_rows = result[result["Gross Salary"].isna()]
+                st.warning(
+                    f"⚠️ {len(missing_rows)} row(s) have a blank/missing Basic value and were skipped "
+                    f"from the totals below (shown as blank in the table)."
+                )
 
             st.markdown("#### Payroll Results")
             st.dataframe(result, use_container_width=True, height=400)
@@ -249,50 +358,109 @@ if employee_type == "Full-Time":
 else:  # Gig/Contract
 
     # ------------------------------------------------------------------ #
-    # Quick converter: In-Hand <-> Billing (single worker, no upload needed)
+    # Quick converter: In-Hand <-> Billing
     # ------------------------------------------------------------------ #
     with st.expander("🔄 Quick Convert: In-Hand ⇄ Billing", expanded=True):
         st.caption(
-            "Convert a single gig worker's In-Hand payment to the Billing (invoice) amount "
-            "that includes TDS, or work backwards from a known Billing amount to what the "
-            "worker actually receives in-hand."
+            "Convert In-Hand payment to the Billing (invoice) amount that includes TDS, or work "
+            "backwards from a known Billing amount to what the worker actually receives in-hand."
         )
+
+        gig_conv_input_mode = st.radio("Input method", ["Single Worker", "Bulk Upload"], horizontal=True, key="gig_conv_input_mode")
 
         gc1, gc2 = st.columns(2)
         with gc1:
-            gig_conv_mode = st.radio(
-                "Conversion direction",
-                ["In-Hand → Billing", "Billing → In-Hand"],
-                horizontal=True,
-                key="gig_conv_mode",
-            )
+            gig_conv_mode = st.radio("Conversion direction", ["In-Hand → Billing", "Billing → In-Hand"], horizontal=True, key="gig_conv_mode")
         with gc2:
             gig_conv_tds = st.number_input("TDS %", min_value=0.0, value=1.0, step=0.1, key="gig_conv_tds")
 
-        if gig_conv_mode == "In-Hand → Billing":
-            inhand_val = st.number_input("In-Hand Amount (₹)", min_value=0.0, value=20000.0, key="gig_conv_inhand")
-            if st.button("Convert", key="gig_conv_btn_i2b"):
-                res = gig_inhand_to_billing(inhand_val, gig_conv_tds)
-                g1, g2, g3 = st.columns(3)
-                g1.metric("In-Hand Amount", f"₹{res['In-Hand Amount']:,.0f}")
-                g2.metric("TDS Amount", f"₹{res['TDS Amount']:,.0f}")
-                g3.metric("Billing Amount", f"₹{res['Billing Amount']:,.0f}")
-        else:
-            billing_val = st.number_input("Billing Amount (₹)", min_value=0.0, value=20200.0, key="gig_conv_billing")
-            if st.button("Convert", key="gig_conv_btn_b2i"):
-                res = gig_billing_to_inhand(billing_val, gig_conv_tds)
-                g1, g2, g3 = st.columns(3)
-                g1.metric("Billing Amount", f"₹{res['Billing Amount']:,.0f}")
-                g2.metric("TDS Amount", f"₹{res['TDS Amount']:,.0f}")
-                g3.metric("In-Hand Amount", f"₹{res['In-Hand Amount']:,.0f}")
+        if gig_conv_input_mode == "Single Worker":
+            if gig_conv_mode == "In-Hand → Billing":
+                inhand_val = st.number_input("In-Hand Amount (₹)", min_value=0.0, value=20000.0, key="gig_conv_inhand")
+                if st.button("Convert", key="gig_conv_btn_i2b"):
+                    res = gig_inhand_to_billing(inhand_val, gig_conv_tds)
+                    g1, g2, g3 = st.columns(3)
+                    g1.metric("In-Hand Amount", f"₹{res['In-Hand Amount']:,.0f}")
+                    g2.metric("TDS Amount", f"₹{res['TDS Amount']:,.0f}")
+                    g3.metric("Billing Amount", f"₹{res['Billing Amount']:,.0f}")
+            else:
+                billing_val = st.number_input("Billing Amount (₹)", min_value=0.0, value=20200.0, key="gig_conv_billing")
+                if st.button("Convert", key="gig_conv_btn_b2i"):
+                    res = gig_billing_to_inhand(billing_val, gig_conv_tds)
+                    g1, g2, g3 = st.columns(3)
+                    g1.metric("Billing Amount", f"₹{res['Billing Amount']:,.0f}")
+                    g2.metric("TDS Amount", f"₹{res['TDS Amount']:,.0f}")
+                    g3.metric("In-Hand Amount", f"₹{res['In-Hand Amount']:,.0f}")
+
+        else:  # Bulk conversion
+            if gig_conv_mode == "In-Hand → Billing":
+                st.caption("Columns required: **Worker ID, Name, In-Hand Amount**.")
+                sample = sample_gig_inhand_to_billing_template()
+                st.dataframe(sample, use_container_width=True)
+                st.download_button("⬇️ Download sample template", data=to_excel_bytes({"Template": sample}),
+                                    file_name="gig_inhand_to_billing_template.xlsx", key="dl_gig_i2b_template")
+
+                uploaded_gc = st.file_uploader("Upload sheet (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="gig_bulk_i2b")
+                if uploaded_gc:
+                    gc_df = read_any_table(uploaded_gc)
+                    st.dataframe(gc_df, use_container_width=True)
+                    if "In-Hand Amount" not in gc_df.columns:
+                        st.error("Missing required column: 'In-Hand Amount'")
+                    elif st.button("Convert all rows", key="btn_gig_bulk_i2b"):
+                        try:
+                            work = gc_df.copy()
+                            amounts = pd.to_numeric(
+                                work["In-Hand Amount"].astype(str).str.replace(r"[₹$,\s]", "", regex=True),
+                                errors="raise",
+                            )
+                            work["TDS Amount"] = amounts * gig_conv_tds / 100
+                            work["Billing Amount"] = amounts + work["TDS Amount"]
+                            st.success(f"Converted {len(work)} row(s).")
+                            st.dataframe(work, use_container_width=True, height=400)
+                            download_button_for_df(work, "⬇️ Download results", "bulk_gig_inhand_to_billing_results.xlsx")
+                        except Exception as e:
+                            _show_error(e, "converting In-Hand to Billing")
+
+            else:  # Billing -> In-Hand bulk
+                st.caption("Columns required: **Worker ID, Name, Billing Amount**.")
+                sample = sample_gig_billing_to_inhand_template()
+                st.dataframe(sample, use_container_width=True)
+                st.download_button("⬇️ Download sample template", data=to_excel_bytes({"Template": sample}),
+                                    file_name="gig_billing_to_inhand_template.xlsx", key="dl_gig_b2i_template")
+
+                uploaded_gc2 = st.file_uploader("Upload sheet (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="gig_bulk_b2i")
+                if uploaded_gc2:
+                    gc_df2 = read_any_table(uploaded_gc2)
+                    st.dataframe(gc_df2, use_container_width=True)
+                    if "Billing Amount" not in gc_df2.columns:
+                        st.error("Missing required column: 'Billing Amount'")
+                    elif st.button("Convert all rows", key="btn_gig_bulk_b2i"):
+                        try:
+                            work = gc_df2.copy()
+                            billing_amounts = pd.to_numeric(
+                                work["Billing Amount"].astype(str).str.replace(r"[₹$,\s]", "", regex=True),
+                                errors="raise",
+                            )
+                            work["In-Hand Amount"] = billing_amounts / (1 + gig_conv_tds / 100)
+                            work["TDS Amount"] = billing_amounts - work["In-Hand Amount"]
+                            st.success(f"Converted {len(work)} row(s).")
+                            st.dataframe(work, use_container_width=True, height=400)
+                            download_button_for_df(work, "⬇️ Download results", "bulk_gig_billing_to_inhand_results.xlsx")
+                        except Exception as e:
+                            _show_error(e, "converting Billing to In-Hand")
 
     st.divider()
 
     # ------------------------------------------------------------------ #
-    # Bulk upload billing calculation (unchanged from your version)
+    # Bulk upload billing calculation
     # ------------------------------------------------------------------ #
     st.markdown("#### Upload Gig Worker Data")
-    st.caption("Columns: Worker ID, Name, Payment Amount")
+    st.caption("Columns required: **Worker ID, Name, Payment Amount**.")
+
+    gig_sample = sample_gig_billing_template()
+    st.dataframe(gig_sample, use_container_width=True)
+    st.download_button("⬇️ Download sample template", data=to_excel_bytes({"Template": gig_sample}),
+                        file_name="gig_billing_template.xlsx", key="dl_gig_billing_template")
 
     uploaded = st.file_uploader("Upload Gig Worker Data (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="gig")
 
@@ -320,7 +488,7 @@ else:  # Gig/Contract
                 st.session_state["gig_result"] = result
                 st.success("✅ Billing calculated successfully!")
             except Exception as e:
-                st.error(safe_error_message(e, context="calculating billing"))
+                _show_error(e, "calculating billing")
 
         if "gig_result" in st.session_state:
             result = st.session_state["gig_result"]
