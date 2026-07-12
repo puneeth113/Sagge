@@ -339,6 +339,84 @@ def compute_incentives(
 # 3. Payroll: Full-time employees (PF + ESIC) & Gig workers (TDS)
 # --------------------------------------------------------------------------
 
+def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.Series:
+    """Cleans a column that should be numeric but may have been uploaded as
+    text — a very common real-world case: Excel cells formatted as Text,
+    numbers with thousands separators ('15,000'), or a currency symbol
+    ('₹15,000'). Strips ₹/$/commas/whitespace, then converts.
+
+    Raises a ValueError naming exactly which rows couldn't be parsed (with
+    up to 5 examples), instead of letting a cryptic TypeError surface deep
+    inside a downstream calculation. Blank/NaN cells are left as NaN — a
+    missing value isn't a formatting error, and callers can decide how to
+    handle it (e.g. warn and skip that row) rather than have this function
+    force a decision.
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        return series
+
+    cleaned = series.astype(str).str.replace(r"[₹$,\s]", "", regex=True).str.strip()
+    cleaned = cleaned.replace({"": None, "nan": None, "None": None, "NaT": None})
+    numeric = pd.to_numeric(cleaned, errors="coerce")
+
+    bad_mask = numeric.isna() & series.notna()
+    if bad_mask.any():
+        bad_rows = series[bad_mask]
+        examples = ", ".join(f"row {i + 2}: '{v}'" for i, v in bad_rows.head(5).items())
+        more = f" (+{bad_mask.sum() - 5} more)" if bad_mask.sum() > 5 else ""
+        raise ValueError(
+            f"Column '{column_name}' has {bad_mask.sum()} value(s) that aren't valid numbers "
+            f"— e.g. {examples}{more}. Please fix these cells and re-upload."
+        )
+    return numeric
+
+
+# --------------------------------------------------------------------------
+# Sample templates for payroll bulk sections
+# --------------------------------------------------------------------------
+
+def sample_fulltime_payroll_template() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"Employee ID": "E001", "Name": "Ravi Kumar", "Basic": 15000, "HRA": 2000, "Other Allowances": 500},
+        {"Employee ID": "E002", "Name": "Sita Sharma", "Basic": 22000, "HRA": 3000, "Other Allowances": 0},
+    ])
+
+
+def sample_gig_billing_template() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"Worker ID": "W001", "Name": "Arjun Das", "Payment Amount": 18000},
+        {"Worker ID": "W002", "Name": "Meena Iyer", "Payment Amount": 22000},
+    ])
+
+
+def sample_gross_to_inhand_template() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"Employee ID": "E001", "Name": "Ravi Kumar", "Gross Salary": 17500, "Fixed Allowances": 2000},
+        {"Employee ID": "E002", "Name": "Sita Sharma", "Gross Salary": 25000, "Fixed Allowances": 3000},
+    ])
+
+
+def sample_inhand_to_gross_template() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"Employee ID": "E001", "Name": "Ravi Kumar", "Desired In-Hand": 15000, "Fixed Allowances": 2000},
+        {"Employee ID": "E002", "Name": "Sita Sharma", "Desired In-Hand": 21000, "Fixed Allowances": 3000},
+    ])
+
+
+def sample_gig_inhand_to_billing_template() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"Worker ID": "W001", "Name": "Arjun Das", "In-Hand Amount": 18000},
+        {"Worker ID": "W002", "Name": "Meena Iyer", "In-Hand Amount": 22000},
+    ])
+
+
+def sample_gig_billing_to_inhand_template() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"Worker ID": "W001", "Name": "Arjun Das", "Billing Amount": 18180},
+        {"Worker ID": "W002", "Name": "Meena Iyer", "Billing Amount": 22220},
+    ])
+
+
 def compute_fulltime_payroll(
     df: pd.DataFrame,
     basic_col: str,
@@ -363,6 +441,12 @@ def compute_fulltime_payroll(
         Employee 0.75%, Employer 3.25% of Gross.
     """
     out = df.copy()
+
+    out[basic_col] = coerce_numeric_column(out[basic_col], basic_col)
+    if hra_col and hra_col in out.columns:
+        out[hra_col] = coerce_numeric_column(out[hra_col], hra_col)
+    if other_allow_col and other_allow_col in out.columns:
+        out[other_allow_col] = coerce_numeric_column(out[other_allow_col], other_allow_col)
 
     hra = out[hra_col] if hra_col and hra_col in out.columns else 0
     other = out[other_allow_col] if other_allow_col and other_allow_col in out.columns else 0
@@ -407,6 +491,7 @@ def compute_gig_worker_billing(
     instead — flagged here as an assumption to confirm.
     """
     out = df.copy()
+    out[amount_col] = coerce_numeric_column(out[amount_col], amount_col)
     out["TDS Amount"] = out[amount_col] * tds_pct / 100
     out["Monthly Billing Amount"] = out[amount_col] + out["TDS Amount"]
     return out
