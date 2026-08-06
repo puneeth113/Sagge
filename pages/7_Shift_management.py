@@ -178,6 +178,31 @@ def sample_shift_template() -> pd.DataFrame:
     ])
 
 
+def format_time_obj(dt) -> str:
+    """Format a datetime.datetime or datetime.time into H:MM (no leading zero hour).
+    Returns None if input is None/NaN.
+    """
+    if dt is None or pd.isna(dt):
+        return None
+    try:
+        if isinstance(dt, datetime):
+            h = dt.hour
+            m = dt.minute
+        elif isinstance(dt, time):
+            h = dt.hour
+            m = dt.minute
+        else:
+            # try parsing
+            t = _parse_time_to_time(dt)
+            if t is None:
+                return None
+            h = t.hour
+            m = t.minute
+        return f"{h}:{m:02d}"
+    except Exception:
+        return None
+
+
 st.markdown("#### 1 — Shift defaults & quick settings")
 with st.expander("Defaults (category working hours)", expanded=True):
     c1, c2, c3 = st.columns(3)
@@ -211,9 +236,12 @@ with st.expander("Compute a single shift from First Bell", expanded=False):
                 today = date.today()
                 start_dt = datetime.combine(today, first_bell_time)
                 end_dt = start_dt + dur
-                # display in 24-hour format
-                st.metric("Shift Start", start_dt.strftime("%H:%M"))
-                st.metric("Shift End", end_dt.strftime("%H:%M"))
+                # display in compact H:MM-H:MM format
+                start_str = format_time_obj(start_dt)
+                end_str = format_time_obj(end_dt)
+                st.metric("Shift Start", start_str)
+                st.metric("Shift End", end_str)
+                st.markdown(f"**Shift:** {start_str}-{end_str}")
                 st.write(f"Working hours: {format_timedelta(dur)} (HH:MM)")
         except Exception as e:
             st.error(safe_error_message(e, context="computing single shift"))
@@ -300,9 +328,12 @@ if uploaded:
                 starts.append(start_dt)
                 durations.append(td)
 
-            # output in strict 24-hour HH:MM format
-            work["Shift Start"] = [s.strftime("%H:%M") if s is not None and not pd.isna(s) else None for s in starts]
-            work["Shift End"] = [e.strftime("%H:%M") if e is not None and not pd.isna(e) else None for e in ends]
+            # output in compact H:MM format and a combined Start-End column like "7:45-14:00"
+            start_strs = [format_time_obj(s) for s in starts]
+            end_strs = [format_time_obj(e) for e in ends]
+            work["Shift Start"] = start_strs
+            work["Shift End"] = end_strs
+            work["Shift (Start-End)"] = [f"{a}-{b}" if a and b else (a or b) for a, b in zip(start_strs, end_strs)]
             work["Working Hours (HH:MM)"] = [format_timedelta(d) if d is not None else None for d in durations]
 
             st.session_state["computed_shifts"] = work
