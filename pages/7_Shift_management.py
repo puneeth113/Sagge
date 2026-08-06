@@ -203,18 +203,107 @@ def format_time_obj(dt) -> str:
         return None
 
 
+# --- New helpers: auto-detect columns and category management -----------------
+
+def _normalize_col(c: str) -> str:
+    return str(c).strip().lower()
+
+
+def detect_columns(cols: list) -> dict:
+    """Try to auto-detect common column names. Returns mapping or None for missing."""
+    norm = {c: _normalize_col(c) for c in cols}
+
+    def find(candidates):
+        for orig, lower in norm.items():
+            for cand in candidates:
+                if cand in lower:
+                    return orig
+        return None
+
+    id_candidates = ["employee id", "emp id", "id", "employeeid", "empid"]
+    name_candidates = ["employee name", "name", "emp name", "employee_name"]
+    desig_candidates = ["designation", "role", "job title", "designation"]
+    first_bell_candidates = ["first bell time", "first bell", "bell time", "first_bell_time", "start time", "time", "start_time"]
+    category_candidates = ["category", "cat", "shift category", "category"]
+    override_candidates = ["category working hours", "working hours", "per-row working hours", "hours", "category_working_hours"]
+
+    return {
+        "id": find(id_candidates),
+        "name": find(name_candidates),
+        "designation": find(desig_candidates),
+        "first_bell": find(first_bell_candidates),
+        "category": find(category_candidates),
+        "override_hours": find(override_candidates),
+    }
+
+
+# --- UI: Two main sections as requested -------------------------------------
+
+st.markdown("#### A — Category management & default timings")
+with st.expander("Create / edit categories and their default working hours", expanded=True):
+    st.caption("Edit existing category default hours or add new custom categories. Use HH:MM format.")
+    cols = st.columns(3)
+    # display existing defaults (editable)
+    with cols[0]:
+        st.markdown("**Existing categories**")
+        editable_defaults = {}
+        for k, v in DEFAULT_WORKING_HOURS.items():
+            newv = st.text_input(f"{k} default hours (HH:MM)", value=v, key=f"cat_{k}")
+            editable_defaults[k] = newv
+    # allow adding a new category
+    with cols[1]:
+        st.markdown("**Add new category**")
+        new_cat_key = st.text_input("Category code (e.g. G1)", value="", max_chars=10, key="new_cat_key")
+        new_cat_hours = st.text_input("Default hours (HH:MM)", value="", key="new_cat_hours")
+        if st.button("Add / Update category", key="add_update_cat"):
+            if not new_cat_key.strip():
+                st.error("Provide a category code (non-empty).")
+            else:
+                editable_defaults[new_cat_key.strip().upper()] = new_cat_hours.strip()
+                st.success(f"Added/Updated category {new_cat_key.strip().upper()}")
+    with cols[2]:
+        st.markdown("**Apply changes**")
+        if st.button("Save category timings", key="save_cat_timings"):
+            # update runtime defaults in session_state so subsequent compute uses them
+            st.session_state.setdefault("runtime_defaults", {})
+            for k, v in editable_defaults.items():
+                if v is None:
+                    continue
+                st.session_state["runtime_defaults"][k] = v.strip()
+            st.success("Saved category timings to session state.")
+
+# build runtime defaults (fall back to session_state or DEFAULT_WORKING_HOURS)
+_runtime_defaults = DEFAULT_WORKING_HOURS.copy()
+if "runtime_defaults" in st.session_state:
+    _runtime_defaults = {**_runtime_defaults, **st.session_state.get("runtime_defaults", {})}
+# expose runtime_defaults with a simple name for existing code
+runtime_defaults = _runtime_defaults
+
+
+st.markdown("#### B — Shift computation (single/manual + bulk)")
+
 st.markdown("#### 1 — Shift defaults & quick settings")
-with st.expander("Defaults (category working hours)", expanded=True):
+with st.expander("Defaults (category working hours)", expanded=False):
     c1, c2, c3 = st.columns(3)
+    # show three main categories if present, else show available ones
+    keys = list(runtime_defaults.keys())
+    # try to pick PP/APP/L positions
+    def val_for(k):
+        return runtime_defaults.get(k, "")
     with c1:
-        pp_default = st.text_input("Preprimary (PP) default working hours (HH:MM)", value=DEFAULT_WORKING_HOURS["PP"], key="pp_default")
+        pp_default = st.text_input("Preprimary (PP) default working hours (HH:MM)", value=val_for("PP"), key="pp_default")
     with c2:
-        app_default = st.text_input("Above Primary (APP) default working hours (HH:MM)", value=DEFAULT_WORKING_HOURS["APP"], key="app_default")
+        app_default = st.text_input("Above Primary (APP) default working hours (HH:MM)", value=val_for("APP"), key="app_default")
     with c3:
-        l_default = st.text_input("Leader (L) default working hours (HH:MM)", value=DEFAULT_WORKING_HOURS["L"], key="l_default")
+        l_default = st.text_input("Leader (L) default working hours (HH:MM)", value=val_for("L"), key="l_default")
+
+# merge any edits back into runtime defaults
+for k in ("PP", "APP", "L"):
+    if k in runtime_defaults:
+        runtime_defaults[k] = locals().get(f"{k.lower()}_default", runtime_defaults[k])
 
 # build runtime defaults
-runtime_defaults = {"PP": pp_default, "APP": app_default, "L": l_default}
+runtime_defaults = {**runtime_defaults, "PP": pp_default or runtime_defaults.get("PP"), "APP": app_default or runtime_defaults.get("APP"), "L": l_default or runtime_defaults.get("L")}
 
 st.markdown("#### 2 — Single / Manual shift compute")
 with st.expander("Compute a single shift from First Bell", expanded=False):
@@ -223,7 +312,7 @@ with st.expander("Compute a single shift from First Bell", expanded=False):
         # time_input returns a datetime.time object; keep as-is but display in 24-hour on output
         first_bell_time = st.time_input("First Bell time (24-hour HH:MM)", value=datetime.now().time().replace(second=0, microsecond=0))
     with col2:
-        category = st.selectbox("Category", ["PP", "APP", "L"], index=0)
+        category = st.selectbox("Category", list(runtime_defaults.keys()), index=0)
     with col3:
         override_hours = st.text_input("Override working hours (optional, HH:MM)", value="")
 
@@ -261,13 +350,29 @@ if uploaded:
         st.dataframe(df.head(5), use_container_width=True)
         cols = list(df.columns)
 
-        st.markdown("##### Map columns in your upload")
-        id_col = st.selectbox("Employee ID column (optional)", ["(none)"] + cols, index=0)
-        name_col = st.selectbox("Employee Name column (optional)", ["(none)"] + cols, index=0)
-        designation_col = st.selectbox("Designation column (optional)", ["(none)"] + cols, index=0)
-        first_bell_col = st.selectbox("First Bell Time column (required)", cols, key="first_bell_col")
-        category_col = st.selectbox("Category column (required: PP/APP/L)", cols, key="category_col")
-        override_hours_col = st.selectbox("Per-row Working Hours column (optional, HH:MM)", ["(none)"] + cols, index=0)
+        # attempt auto-detection
+        detected = detect_columns(cols)
+        required_found = detected.get("first_bell") and detected.get("category")
+
+        st.markdown("##### Column mapping")
+        if required_found:
+            st.success("Required columns auto-detected: First Bell and Category. Mapping will be applied automatically.")
+            # show detected mapping in compact way and allow override
+            with st.expander("Detected mapping (click to override)"):
+                id_col = st.selectbox("Employee ID column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["id"])) if detected.get("id") in cols else 0)
+                name_col = st.selectbox("Employee Name column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["name"])) if detected.get("name") in cols else 0)
+                designation_col = st.selectbox("Designation column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["designation"])) if detected.get("designation") in cols else 0)
+                first_bell_col = st.selectbox("First Bell Time column (required)", cols, index=cols.index(detected["first_bell"]))
+                category_col = st.selectbox("Category column (required: PP/APP/L)", cols, index=cols.index(detected["category"]))
+                override_hours_col = st.selectbox("Per-row Working Hours column (optional, HH:MM)", ["(none)"] + cols, index=(1 + cols.index(detected["override_hours"])) if detected.get("override_hours") in cols else 0)
+        else:
+            st.info("Could not auto-detect required columns — please map them below.")
+            id_col = st.selectbox("Employee ID column (optional)", ["(none)"] + cols, index=0)
+            name_col = st.selectbox("Employee Name column (optional)", ["(none)"] + cols, index=0)
+            designation_col = st.selectbox("Designation column (optional)", ["(none)"] + cols, index=0)
+            first_bell_col = st.selectbox("First Bell Time column (required)", cols, key="first_bell_col")
+            category_col = st.selectbox("Category column (required: PP/APP/L)", cols, key="category_col")
+            override_hours_col = st.selectbox("Per-row Working Hours column (optional, HH:MM)", ["(none)"] + cols, index=0)
 
         if st.button("Compute shifts for uploaded sheet"):
             work = df.copy()
