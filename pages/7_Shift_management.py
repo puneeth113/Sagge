@@ -282,171 +282,170 @@ runtime_defaults = _runtime_defaults
 
 st.markdown("#### B — Shift computation (single/manual + bulk)")
 
-st.markdown("#### 1 — Shift defaults & quick settings")
-with st.expander("Defaults (category working hours)", expanded=False):
-    c1, c2, c3 = st.columns(3)
-    # show three main categories if present, else show available ones
-    keys = list(runtime_defaults.keys())
-    # try to pick PP/APP/L positions
-    def val_for(k):
-        return runtime_defaults.get(k, "")
-    with c1:
-        pp_default = st.text_input("Preprimary (PP) default working hours (HH:MM)", value=val_for("PP"), key="pp_default")
-    with c2:
-        app_default = st.text_input("Above Primary (APP) default working hours (HH:MM)", value=val_for("APP"), key="app_default")
-    with c3:
-        l_default = st.text_input("Leader (L) default working hours (HH:MM)", value=val_for("L"), key="l_default")
+# --- Sub-navigation: two tabs to match requested layout ---------------------
+sub_tabs = st.tabs(["📥 Bulk Upload", "✍️ Single Branch (manual)"])
 
-# merge any edits back into runtime defaults
-for k in ("PP", "APP", "L"):
-    if k in runtime_defaults:
-        runtime_defaults[k] = locals().get(f"{k.lower()}_default", runtime_defaults[k])
+# Bulk tab (index 0)
+with sub_tabs[0]:
+    st.markdown("#### Bulk upload (assign shifts & auto-compute start/end times)")
+    st.caption("Upload a sheet with at least: First Bell Time, Category (PP/APP/L) and optional per-row working hours. The sheet can also include Employee ID/Name/Designation.")
 
-# build runtime defaults
-runtime_defaults = {**runtime_defaults, "PP": pp_default or runtime_defaults.get("PP"), "APP": app_default or runtime_defaults.get("APP"), "L": l_default or runtime_defaults.get("L")}
+    with st.container():
+        with st.expander("Defaults (category working hours)", expanded=False):
+            c1, c2, c3 = st.columns(3)
+            def val_for(k):
+                return runtime_defaults.get(k, "")
+            with c1:
+                pp_default = st.text_input("Preprimary (PP) default working hours (HH:MM)", value=val_for("PP"), key="pp_default_bulk")
+            with c2:
+                app_default = st.text_input("Above Primary (APP) default working hours (HH:MM)", value=val_for("APP"), key="app_default_bulk")
+            with c3:
+                l_default = st.text_input("Leader (L) default working hours (HH:MM)", value=val_for("L"), key="l_default_bulk")
+            # update runtime defaults with any edits in this expander
+            runtime_defaults.update({"PP": pp_default or runtime_defaults.get("PP"), "APP": app_default or runtime_defaults.get("APP"), "L": l_default or runtime_defaults.get("L")})
 
-st.markdown("#### 2 — Single / Manual shift compute")
-with st.expander("Compute a single shift from First Bell", expanded=False):
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        # time_input returns a datetime.time object; keep as-is but display in 24-hour on output
-        first_bell_time = st.time_input("First Bell time (24-hour HH:MM)", value=datetime.now().time().replace(second=0, microsecond=0))
-    with col2:
-        category = st.selectbox("Category", list(runtime_defaults.keys()), index=0)
-    with col3:
-        override_hours = st.text_input("Override working hours (optional, HH:MM)", value="")
+        uploaded = st.file_uploader("Upload shift assignments (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="shifts_bulk_tab")
 
-    if st.button("Compute Shift (single)"):
-        try:
-            dur = parse_duration_to_timedelta(override_hours) if override_hours else parse_duration_to_timedelta(runtime_defaults.get(category))
-            if dur is None:
-                st.error("Could not parse working hours. Use HH:MM format, e.g. 6:15")
-            else:
-                today = date.today()
-                start_dt = datetime.combine(today, first_bell_time)
-                end_dt = start_dt + dur
-                # display in compact H:MM-H:MM format
-                start_str = format_time_obj(start_dt)
-                end_str = format_time_obj(end_dt)
-                st.metric("Shift Start", start_str)
-                st.metric("Shift End", end_str)
-                st.markdown(f"**Shift:** {start_str}-{end_str}")
-                st.write(f"Working hours: {format_timedelta(dur)} (HH:MM)")
-        except Exception as e:
-            st.error(safe_error_message(e, context="computing single shift"))
+        if st.button("Download sample template", key="download_sample_shift_bulk"):
+            tmp = sample_shift_template()
+            download_button_for_df(tmp, "⬇️ Download sample shift template", "sample_shift_template.xlsx")
 
-st.markdown("#### 3 — Bulk upload (assign shifts & auto-compute start/end times)")
-st.caption("Upload a sheet with at least: First Bell Time, Category (PP/APP/L) and optional per-row working hours. The sheet can also include Employee ID/Name/Designation.")
+        if uploaded:
+            try:
+                df = read_any_table(uploaded)
+                st.dataframe(df.head(5), use_container_width=True)
+                cols = list(df.columns)
 
-uploaded = st.file_uploader("Upload shift assignments (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="shifts_bulk")
+                # attempt auto-detection
+                detected = detect_columns(cols)
+                required_found = detected.get("first_bell") and detected.get("category")
 
-if st.button("Download sample template", key="download_sample_shift"):
-    tmp = sample_shift_template()
-    download_button_for_df(tmp, "⬇️ Download sample shift template", "sample_shift_template.xlsx")
-
-if uploaded:
-    try:
-        df = read_any_table(uploaded)
-        st.dataframe(df.head(5), use_container_width=True)
-        cols = list(df.columns)
-
-        # attempt auto-detection
-        detected = detect_columns(cols)
-        required_found = detected.get("first_bell") and detected.get("category")
-
-        st.markdown("##### Column mapping")
-        if required_found:
-            st.success("Required columns auto-detected: First Bell and Category. Mapping will be applied automatically.")
-            # show detected mapping in compact way and allow override
-            with st.expander("Detected mapping (click to override)"):
-                id_col = st.selectbox("Employee ID column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["id"])) if detected.get("id") in cols else 0)
-                name_col = st.selectbox("Employee Name column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["name"])) if detected.get("name") in cols else 0)
-                designation_col = st.selectbox("Designation column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["designation"])) if detected.get("designation") in cols else 0)
-                first_bell_col = st.selectbox("First Bell Time column (required)", cols, index=cols.index(detected["first_bell"]))
-                category_col = st.selectbox("Category column (required: PP/APP/L)", cols, index=cols.index(detected["category"]))
-                override_hours_col = st.selectbox("Per-row Working Hours column (optional, HH:MM)", ["(none)"] + cols, index=(1 + cols.index(detected["override_hours"])) if detected.get("override_hours") in cols else 0)
-        else:
-            st.info("Could not auto-detect required columns — please map them below.")
-            id_col = st.selectbox("Employee ID column (optional)", ["(none)"] + cols, index=0)
-            name_col = st.selectbox("Employee Name column (optional)", ["(none)"] + cols, index=0)
-            designation_col = st.selectbox("Designation column (optional)", ["(none)"] + cols, index=0)
-            first_bell_col = st.selectbox("First Bell Time column (required)", cols, key="first_bell_col")
-            category_col = st.selectbox("Category column (required: PP/APP/L)", cols, key="category_col")
-            override_hours_col = st.selectbox("Per-row Working Hours column (optional, HH:MM)", ["(none)"] + cols, index=0)
-
-        if st.button("Compute shifts for uploaded sheet"):
-            work = df.copy()
-
-            # parse first bell times to datetime.time (24-hour aware)
-            work["_first_bell_parsed"] = work[first_bell_col].apply(_parse_time_to_time)
-
-            # normalize category values
-            work["_category_norm"] = work[category_col].astype(str).str.strip().str.upper()
-
-            # compute durations
-            def choose_duration(row):
-                # per-row override column if provided
-                if override_hours_col != "(none)" and override_hours_col in work.columns:
-                    val = row.get(override_hours_col, None)
-                    if pd.notna(val) and str(val).strip() != "":
-                        td = parse_duration_to_timedelta(val)
-                        if td is not None:
-                            return td
-                # category-based default (runtime_defaults)
-                cat = row["_category_norm"] if pd.notna(row["_category_norm"]) else ""
-                # map common full words to keys
-                if cat.startswith("PRE"):
-                    key = "PP"
-                elif cat.startswith("APP") or cat.startswith("ABOVE"):
-                    key = "APP"
-                elif cat.startswith("L") or cat.startswith("LEAD") or cat.startswith("SUP"):
-                    key = "L"
+                st.markdown("##### Column mapping")
+                if required_found:
+                    st.success("Required columns auto-detected: First Bell and Category. Mapping will be applied automatically.")
+                    # show detected mapping in compact way and allow override
+                    with st.expander("Detected mapping (click to override)"):
+                        id_col = st.selectbox("Employee ID column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["id"])) if detected.get("id") in cols else 0)
+                        name_col = st.selectbox("Employee Name column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["name"])) if detected.get("name") in cols else 0)
+                        designation_col = st.selectbox("Designation column (optional)", ["(none)"] + cols, index=(1 + cols.index(detected["designation"])) if detected.get("designation") in cols else 0)
+                        first_bell_col = st.selectbox("First Bell Time column (required)", cols, index=cols.index(detected["first_bell"]))
+                        category_col = st.selectbox("Category column (required: PP/APP/L)", cols, index=cols.index(detected["category"]))
+                        override_hours_col = st.selectbox("Per-row Working Hours column (optional, HH:MM)", ["(none)"] + cols, index=(1 + cols.index(detected["override_hours"])) if detected.get("override_hours") in cols else 0)
                 else:
-                    # fallback - try exact match
-                    key = cat if cat in runtime_defaults else None
-                if key and key in runtime_defaults and runtime_defaults[key]:
-                    return parse_duration_to_timedelta(runtime_defaults[key])
-                # final fallback - None
-                return None
+                    st.info("Could not auto-detect required columns — please map them below.")
+                    id_col = st.selectbox("Employee ID column (optional)", ["(none)"] + cols, index=0)
+                    name_col = st.selectbox("Employee Name column (optional)", ["(none)"] + cols, index=0)
+                    designation_col = st.selectbox("Designation column (optional)", ["(none)"] + cols, index=0)
+                    first_bell_col = st.selectbox("First Bell Time column (required)", cols, key="first_bell_col_bulk")
+                    category_col = st.selectbox("Category column (required: PP/APP/L)", cols, key="category_col_bulk")
+                    override_hours_col = st.selectbox("Per-row Working Hours column (optional, HH:MM)", ["(none)"] + cols, index=0)
 
-            work["_working_duration_td"] = work.apply(choose_duration, axis=1)
+                if st.button("Compute shifts for uploaded sheet", key="compute_bulk"):
+                    work = df.copy()
 
-            # compute start & end datetimes
-            starts = []
-            ends = []
-            durations = []
-            for _, r in work.iterrows():
-                tb = r["_first_bell_parsed"]
-                td = r["_working_duration_td"]
-                if pd.isna(tb) or tb is None:
-                    starts.append(None)
-                    ends.append(None)
-                    durations.append(None)
-                    continue
-                today = date.today()
-                start_dt = datetime.combine(today, tb)
-                if td is None:
-                    ends.append(None)
+                    # parse first bell times to datetime.time (24-hour aware)
+                    work["_first_bell_parsed"] = work[first_bell_col].apply(_parse_time_to_time)
+
+                    # normalize category values
+                    work["_category_norm"] = work[category_col].astype(str).str.strip().str.upper()
+
+                    # compute durations
+                    def choose_duration(row):
+                        # per-row override column if provided
+                        if override_hours_col != "(none)" and override_hours_col in work.columns:
+                            val = row.get(override_hours_col, None)
+                            if pd.notna(val) and str(val).strip() != "":
+                                td = parse_duration_to_timedelta(val)
+                                if td is not None:
+                                    return td
+                        # category-based default (runtime_defaults)
+                        cat = row["_category_norm"] if pd.notna(row["_category_norm"]) else ""
+                        # map common full words to keys
+                        if cat.startswith("PRE"):
+                            key = "PP"
+                        elif cat.startswith("APP") or cat.startswith("ABOVE"):
+                            key = "APP"
+                        elif cat.startswith("L") or cat.startswith("LEAD") or cat.startswith("SUP"):
+                            key = "L"
+                        else:
+                            # fallback - try exact match
+                            key = cat if cat in runtime_defaults else None
+                        if key and key in runtime_defaults and runtime_defaults[key]:
+                            return parse_duration_to_timedelta(runtime_defaults[key])
+                        # final fallback - None
+                        return None
+
+                    work["_working_duration_td"] = work.apply(choose_duration, axis=1)
+
+                    # compute start & end datetimes
+                    starts = []
+                    ends = []
+                    durations = []
+                    for _, r in work.iterrows():
+                        tb = r["_first_bell_parsed"]
+                        td = r["_working_duration_td"]
+                        if pd.isna(tb) or tb is None:
+                            starts.append(None)
+                            ends.append(None)
+                            durations.append(None)
+                            continue
+                        today = date.today()
+                        start_dt = datetime.combine(today, tb)
+                        if td is None:
+                            ends.append(None)
+                        else:
+                            end_dt = start_dt + td
+                            ends.append(end_dt)
+                        starts.append(start_dt)
+                        durations.append(td)
+
+                    # output in compact H:MM format and a combined Start-End column like "7:45-14:00"
+                    start_strs = [format_time_obj(s) for s in starts]
+                    end_strs = [format_time_obj(e) for e in ends]
+                    work["Shift Start"] = start_strs
+                    work["Shift End"] = end_strs
+                    work["Shift (Start-End)"] = [f"{a}-{b}" if a and b else (a or b) for a, b in zip(start_strs, end_strs)]
+                    work["Working Hours (HH:MM)"] = [format_timedelta(d) if d is not None else None for d in durations]
+
+                    st.session_state["computed_shifts"] = work
+                    st.success(f"Computed shifts for {len(work)} rows.")
+
+            except Exception as e:
+                st.error(safe_error_message(e, context="processing uploaded shift file"))
+
+# Single/manual tab (index 1)
+with sub_tabs[1]:
+    st.markdown("#### Single / Manual shift compute")
+    with st.expander("Compute a single shift from First Bell", expanded=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            # time_input returns a datetime.time object; keep as-is but display in 24-hour on output
+            first_bell_time = st.time_input("First Bell time (24-hour HH:MM)", value=datetime.now().time().replace(second=0, microsecond=0), key="first_bell_single")
+        with col2:
+            category = st.selectbox("Category", list(runtime_defaults.keys()), index=0, key="category_single")
+        with col3:
+            override_hours = st.text_input("Override working hours (optional, HH:MM)", value="", key="override_single")
+
+        if st.button("Compute Shift (single)", key="compute_single"):
+            try:
+                dur = parse_duration_to_timedelta(override_hours) if override_hours else parse_duration_to_timedelta(runtime_defaults.get(category))
+                if dur is None:
+                    st.error("Could not parse working hours. Use HH:MM format, e.g. 6:15")
                 else:
-                    end_dt = start_dt + td
-                    ends.append(end_dt)
-                starts.append(start_dt)
-                durations.append(td)
+                    today = date.today()
+                    start_dt = datetime.combine(today, first_bell_time)
+                    end_dt = start_dt + dur
+                    # display in compact H:MM-H:MM format
+                    start_str = format_time_obj(start_dt)
+                    end_str = format_time_obj(end_dt)
+                    st.metric("Shift Start", start_str)
+                    st.metric("Shift End", end_str)
+                    st.markdown(f"**Shift:** {start_str}-{end_str}")
+                    st.write(f"Working hours: {format_timedelta(dur)} (HH:MM)")
+            except Exception as e:
+                st.error(safe_error_message(e, context="computing single shift"))
 
-            # output in compact H:MM format and a combined Start-End column like "7:45-14:00"
-            start_strs = [format_time_obj(s) for s in starts]
-            end_strs = [format_time_obj(e) for e in ends]
-            work["Shift Start"] = start_strs
-            work["Shift End"] = end_strs
-            work["Shift (Start-End)"] = [f"{a}-{b}" if a and b else (a or b) for a, b in zip(start_strs, end_strs)]
-            work["Working Hours (HH:MM)"] = [format_timedelta(d) if d is not None else None for d in durations]
-
-            st.session_state["computed_shifts"] = work
-            st.success(f"Computed shifts for {len(work)} rows.")
-
-    except Exception as e:
-        st.error(safe_error_message(e, context="processing uploaded shift file"))
-
+# Final computed results area (shared)
 if "computed_shifts" in st.session_state:
     out = st.session_state["computed_shifts"]
     st.divider()
