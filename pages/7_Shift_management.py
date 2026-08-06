@@ -1,0 +1,253 @@
+import os
+import importlib.util
+from datetime import datetime, date, timedelta
+
+import streamlit as st
+import pandas as pd
+
+
+def _load_utils():
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(this_dir)
+    for candidate in (
+        os.path.join(this_dir, "utils.py"),
+        os.path.join(this_dir, "Utils.py"),
+        os.path.join(root_dir, "utils.py"),
+        os.path.join(root_dir, "Utils.py"),
+    ):
+        if os.path.exists(candidate):
+            spec = importlib.util.spec_from_file_location("hr_utils", candidate)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+    raise FileNotFoundError(
+        "Could not find utils.py. Make sure it sits directly inside the "
+        "app's root folder (one level above 'pages/')."
+    )
+
+
+_u = _load_utils()
+render_top_nav = _u.render_top_nav
+read_any_table = _u.read_any_table
+download_button_for_df = _u.download_button_for_df
+to_excel_bytes = _u.to_excel_bytes
+safe_error_message = _u.safe_error_message
+
+
+st.set_page_config(page_title="Shift Management", page_icon="🕒", layout="wide")
+render_top_nav("Shift Management")
+
+st.title("🕒 Shift Management")
+st.caption("Define shifts based on a First-Bell time, assign category-based working hours (PP/APP/L), and bulk-upload shift assignments.")
+
+# Default working hours per category (HH:MM)
+DEFAULT_WORKING_HOURS = {
+    "PP": "6:15",  # Preprimary
+    "APP": "6:45",  # Above Primary
+    "L": "8:15",  # Leader
+}
+
+
+def parse_duration_to_timedelta(s: str) -> timedelta:
+    """Parses a string like '6:15' or '06:15' into a timedelta."""
+    if pd.isna(s):
+        return None
+    if isinstance(s, (int, float)):
+        # treat as minutes if numeric
+        return timedelta(minutes=int(s))
+    text = str(s).strip()
+    if not text:
+        return None
+    try:
+        parts = text.split(":")
+        if len(parts) == 1:
+            # only hours provided
+            hours = int(parts[0])
+            minutes = 0
+        else:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+        return timedelta(hours=hours, minutes=minutes)
+    except Exception:
+        # try parsing as pandas Timedelta
+        try:
+            td = pd.to_timedelta(text)
+            return td
+        except Exception:
+            return None
+
+
+def format_timedelta(td: timedelta) -> str:
+    if td is None or pd.isna(td):
+        return ""
+    total_seconds = int(td.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    return f"{hours:02d}:{minutes:02d}"
+
+
+def sample_shift_template() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "Employee ID": "E001",
+            "Employee Name": "Ravi Kumar",
+            "Designation": "Bus Maid",
+            "Category": "PP",
+            "First Bell Time": "06:00",
+            "Category Working Hours (optional)": "",
+        },
+        {
+            "Employee ID": "E002",
+            "Employee Name": "Sita Sharma",
+            "Designation": "Cleaner",
+            "Category": "APP",
+            "First Bell Time": "06:30",
+            "Category Working Hours (optional)": "6:30",
+        },
+        {
+            "Employee ID": "E003",
+            "Employee Name": "Arjun",
+            "Designation": "Supervisor",
+            "Category": "L",
+            "First Bell Time": "08:00",
+            "Category Working Hours (optional)": "",
+        },
+    ])
+
+
+st.markdown("#### 1 — Shift defaults & quick settings")
+with st.expander("Defaults (category working hours)", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        pp_default = st.text_input("Preprimary (PP) default working hours (HH:MM)", value=DEFAULT_WORKING_HOURS["PP"], key="pp_default")
+    with c2:
+        app_default = st.text_input("Above Primary (APP) default working hours (HH:MM)", value=DEFAULT_WORKING_HOURS["APP"], key="app_default")
+    with c3:
+        l_default = st.text_input("Leader (L) default working hours (HH:MM)", value=DEFAULT_WORKING_HOURS["L"], key="l_default")
+
+# build runtime defaults
+runtime_defaults = {"PP": pp_default, "APP": app_default, "L": l_default}
+
+st.markdown("#### 2 — Single / Manual shift compute")
+with st.expander("Compute a single shift from First Bell", expanded=False):
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        first_bell_time = st.time_input("First Bell time (HH:MM)", value=datetime.now().time().replace(second=0, microsecond=0))
+    with col2:
+        category = st.selectbox("Category", ["PP", "APP", "L"], index=0)
+    with col3:
+        override_hours = st.text_input("Override working hours (optional, HH:MM)", value="")
+
+    if st.button("Compute Shift (single)"):
+        try:
+            dur = parse_duration_to_timedelta(override_hours) if override_hours else parse_duration_to_timedelta(runtime_defaults.get(category))
+            if dur is None:
+                st.error("Could not parse working hours. Use HH:MM format, e.g. 6:15")
+            else:
+                today = date.today()
+                start_dt = datetime.combine(today, first_bell_time)
+                end_dt = start_dt + dur
+                st.metric("Shift Start", start_dt.strftime("%H:%M"))
+                st.metric("Shift End", end_dt.strftime("%H:%M"))
+                st.write(f"Working hours: {format_timedelta(dur)} (HH:MM)")
+        except Exception as e:
+            st.error(safe_error_message(e, context="computing single shift"))
+
+st.markdown("#### 3 — Bulk upload (assign shifts & auto-compute start/end times)")
+st.caption("Upload a sheet with at least: First Bell Time, Category (PP/APP/L) and optional per-row working hours. The sheet can also include Employee ID/Name/Designation.")
+
+uploaded = st.file_uploader("Upload shift assignments (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="shifts_bulk")
+
+if st.button("Download sample template", key="download_sample_shift"):
+    tmp = sample_shift_template()
+    download_button_for_df(tmp, "⬇️ Download sample shift template", "sample_shift_template.xlsx")
+
+if uploaded:
+    try:
+        df = read_any_table(uploaded)
+        st.dataframe(df.head(5), use_container_width=True)
+        cols = list(df.columns)
+
+        st.markdown("##### Map columns in your upload")
+        id_col = st.selectbox("Employee ID column (optional)", ["(none)"] + cols, index=0)
+        name_col = st.selectbox("Employee Name column (optional)", ["(none)"] + cols, index=0)
+        designation_col = st.selectbox("Designation column (optional)", ["(none)"] + cols, index=0)
+        first_bell_col = st.selectbox("First Bell Time column (required)", cols, key="first_bell_col")
+        category_col = st.selectbox("Category column (required: PP/APP/L)", cols, key="category_col")
+        override_hours_col = st.selectbox("Per-row Working Hours column (optional, HH:MM)", ["(none)"] + cols, index=0)
+
+        if st.button("Compute shifts for uploaded sheet"):
+            work = df.copy()
+
+            # parse first bell times to datetimes (time only)
+            work["_first_bell_parsed"] = pd.to_datetime(work[first_bell_col], errors="coerce").dt.time
+
+            # normalize category values
+            work["_category_norm"] = work[category_col].astype(str).str.strip().str.upper()
+
+            # compute durations
+            def choose_duration(row):
+                # per-row override column if provided
+                if override_hours_col != "(none)" and override_hours_col in work.columns:
+                    val = row.get(override_hours_col, None)
+                    if pd.notna(val) and str(val).strip() != "":
+                        td = parse_duration_to_timedelta(val)
+                        if td is not None:
+                            return td
+                # category-based default (runtime_defaults)
+                cat = row["_category_norm"] if pd.notna(row["_category_norm"]) else ""
+                # map common full words to keys
+                if cat.startswith("PRE"):
+                    key = "PP"
+                elif cat.startswith("APP") or cat.startswith("ABOVE"):
+                    key = "APP"
+                elif cat.startswith("L") or cat.startswith("LEAD") or cat.startswith("SUP"):
+                    key = "L"
+                else:
+                    # fallback - try exact match
+                    key = cat if cat in runtime_defaults else None
+                if key and key in runtime_defaults and runtime_defaults[key]:
+                    return parse_duration_to_timedelta(runtime_defaults[key])
+                # final fallback - None
+                return None
+
+            work["_working_duration_td"] = work.apply(choose_duration, axis=1)
+
+            # compute start & end datetimes
+            starts = []
+            ends = []
+            durations = []
+            for _, r in work.iterrows():
+                tb = r["_first_bell_parsed"]
+                td = r["_working_duration_td"]
+                if pd.isna(tb) or tb is None:
+                    starts.append(None)
+                    ends.append(None)
+                    durations.append(None)
+                    continue
+                today = date.today()
+                start_dt = datetime.combine(today, tb)
+                if td is None:
+                    ends.append(None)
+                else:
+                    end_dt = start_dt + td
+                    ends.append(end_dt)
+                starts.append(start_dt)
+                durations.append(td)
+
+            work["Shift Start"] = [s.strftime("%H:%M") if s is not None and not pd.isna(s) else None for s in starts]
+            work["Shift End"] = [e.strftime("%H:%M") if e is not None and not pd.isna(e) else None for e in ends]
+            work["Working Hours (HH:MM)"] = [format_timedelta(d) if d is not None else None for d in durations]
+
+            st.session_state["computed_shifts"] = work
+            st.success(f"Computed shifts for {len(work)} rows.")
+
+    except Exception as e:
+        st.error(safe_error_message(e, context="processing uploaded shift file"))
+
+if "computed_shifts" in st.session_state:
+    out = st.session_state["computed_shifts"]
+    st.divider()
+    st.markdown("#### Computed shift results")
+    st.dataframe(out, use_container_width=True, height=420)
+    download_button_for_df(out, "⬇️ Download computed shifts", "computed_shifts.xlsx")
