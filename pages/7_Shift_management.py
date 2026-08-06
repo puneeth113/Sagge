@@ -1,6 +1,6 @@
 import os
 import importlib.util
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time
 
 import streamlit as st
 import pandas as pd
@@ -77,6 +77,69 @@ def parse_duration_to_timedelta(s: str) -> timedelta:
             return None
 
 
+def _parse_time_to_time(v) -> time:
+    """Robustly parse a variety of time representations and return a datetime.time
+    in 24-hour basis. Handles:
+      - datetime.time or datetime.datetime inputs
+      - strings like '06:00', '6:00 AM', '18:00', '6 PM'
+      - Excel fractional day floats (e.g. 0.25) -> treated as fraction of 24h
+      - pandas Timestamp or parsed datetimes
+    Returns None if parsing fails.
+    """
+    if pd.isna(v):
+        return None
+    # direct time
+    if isinstance(v, time):
+        return v
+    # datetime -> extract time
+    if isinstance(v, datetime):
+        return v.time()
+    # pandas Timestamp
+    try:
+        import pandas as _pd
+
+        if isinstance(v, _pd.Timestamp):
+            return v.to_pydatetime().time()
+    except Exception:
+        pass
+
+    # numeric: handle Excel-like fractional day (0.0 - 1.0) or epoch millis
+    if isinstance(v, (int, float)):
+        try:
+            if 0.0 <= float(v) < 2.0:
+                # treat as fraction of day
+                seconds = int(float(v) * 24 * 3600)
+                h = seconds // 3600
+                m = (seconds % 3600) // 60
+                s = seconds % 60
+                return time(hour=h % 24, minute=m, second=s)
+            # otherwise try as unix timestamp (seconds)
+            try:
+                dt = datetime.fromtimestamp(float(v))
+                return dt.time()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # string: try pandas to_datetime first (flexible)
+    try:
+        parsed = pd.to_datetime(v, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed.time()
+    except Exception:
+        pass
+
+    # fallback to dateutil (more flexible)
+    try:
+        from dateutil import parser
+
+        parsed = parser.parse(str(v))
+        return parsed.time()
+    except Exception:
+        return None
+
+
 def format_timedelta(td: timedelta) -> str:
     if td is None or pd.isna(td):
         return ""
@@ -132,7 +195,8 @@ st.markdown("#### 2 — Single / Manual shift compute")
 with st.expander("Compute a single shift from First Bell", expanded=False):
     col1, col2, col3 = st.columns(3)
     with col1:
-        first_bell_time = st.time_input("First Bell time (HH:MM)", value=datetime.now().time().replace(second=0, microsecond=0))
+        # time_input returns a datetime.time object; keep as-is but display in 24-hour on output
+        first_bell_time = st.time_input("First Bell time (24-hour HH:MM)", value=datetime.now().time().replace(second=0, microsecond=0))
     with col2:
         category = st.selectbox("Category", ["PP", "APP", "L"], index=0)
     with col3:
@@ -147,6 +211,7 @@ with st.expander("Compute a single shift from First Bell", expanded=False):
                 today = date.today()
                 start_dt = datetime.combine(today, first_bell_time)
                 end_dt = start_dt + dur
+                # display in 24-hour format
                 st.metric("Shift Start", start_dt.strftime("%H:%M"))
                 st.metric("Shift End", end_dt.strftime("%H:%M"))
                 st.write(f"Working hours: {format_timedelta(dur)} (HH:MM)")
@@ -179,8 +244,8 @@ if uploaded:
         if st.button("Compute shifts for uploaded sheet"):
             work = df.copy()
 
-            # parse first bell times to datetimes (time only)
-            work["_first_bell_parsed"] = pd.to_datetime(work[first_bell_col], errors="coerce").dt.time
+            # parse first bell times to datetime.time (24-hour aware)
+            work["_first_bell_parsed"] = work[first_bell_col].apply(_parse_time_to_time)
 
             # normalize category values
             work["_category_norm"] = work[category_col].astype(str).str.strip().str.upper()
@@ -235,6 +300,7 @@ if uploaded:
                 starts.append(start_dt)
                 durations.append(td)
 
+            # output in strict 24-hour HH:MM format
             work["Shift Start"] = [s.strftime("%H:%M") if s is not None and not pd.isna(s) else None for s in starts]
             work["Shift End"] = [e.strftime("%H:%M") if e is not None and not pd.isna(e) else None for e in ends]
             work["Working Hours (HH:MM)"] = [format_timedelta(d) if d is not None else None for d in durations]
