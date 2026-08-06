@@ -237,57 +237,68 @@ def detect_columns(cols: list) -> dict:
     }
 
 
-# --- UI: Two main sections as requested -------------------------------------
+# Initialize runtime defaults from session_state or defaults so the category
+# subsection can show and update the live list.
+if "runtime_defaults" not in st.session_state:
+    st.session_state["runtime_defaults"] = DEFAULT_WORKING_HOURS.copy()
 
-st.markdown("#### A — Category management & default timings")
-with st.expander("Create / edit categories and their default working hours", expanded=True):
-    st.caption("Edit existing category default hours or add new custom categories. Use HH:MM format.")
+runtime_defaults = st.session_state["runtime_defaults"]
+
+
+# --- UI: Category creation and Shift computation as separate subsections ----
+
+# Category creation subsection
+st.markdown("#### Category creation")
+with st.expander("View active categories and add/update categories", expanded=True):
+    st.caption("Current active categories and their default working hours. Add a new category or edit existing ones below.")
+    # show current categories as a table
+    try:
+        df_cats = pd.DataFrame([{"Category": k, "Default Hours (HH:MM)": v} for k, v in runtime_defaults.items()])
+        st.table(df_cats)
+    except Exception:
+        st.write(runtime_defaults)
+
+    st.markdown("**Edit existing category default hours**")
     cols = st.columns(3)
-    # display existing defaults (editable)
-    with cols[0]:
-        st.markdown("**Existing categories**")
-        editable_defaults = {}
-        for k, v in DEFAULT_WORKING_HOURS.items():
-            newv = st.text_input(f"{k} default hours (HH:MM)", value=v, key=f"cat_{k}")
-            editable_defaults[k] = newv
-    # allow adding a new category
-    with cols[1]:
-        st.markdown("**Add new category**")
-        new_cat_key = st.text_input("Category code (e.g. G1)", value="", max_chars=10, key="new_cat_key")
-        new_cat_hours = st.text_input("Default hours (HH:MM)", value="", key="new_cat_hours")
-        if st.button("Add / Update category", key="add_update_cat"):
+    edited = {}
+    keys = list(runtime_defaults.keys())
+    for i, k in enumerate(keys):
+        with cols[i % 3]:
+            newv = st.text_input(f"{k} default hours (HH:MM)", value=runtime_defaults.get(k, ""), key=f"edit_cat_{k}")
+            edited[k] = newv
+
+    st.markdown("**Add a new category**")
+    new_cat_col1, new_cat_col2, new_cat_col3 = st.columns([2, 2, 1])
+    with new_cat_col1:
+        new_cat_key = st.text_input("Category code (e.g. G1)", value="", max_chars=10, key="new_cat_key_main")
+    with new_cat_col2:
+        new_cat_hours = st.text_input("Default hours (HH:MM)", value="", key="new_cat_hours_main")
+    with new_cat_col3:
+        if st.button("Add / Update category", key="add_update_cat_main"):
             if not new_cat_key.strip():
                 st.error("Provide a category code (non-empty).")
             else:
-                editable_defaults[new_cat_key.strip().upper()] = new_cat_hours.strip()
-                st.success(f"Added/Updated category {new_cat_key.strip().upper()}")
-    with cols[2]:
-        st.markdown("**Apply changes**")
-        if st.button("Save category timings", key="save_cat_timings"):
-            # update runtime defaults in session_state so subsequent compute uses them
-            st.session_state.setdefault("runtime_defaults", {})
-            for k, v in editable_defaults.items():
-                if v is None:
-                    continue
+                code = new_cat_key.strip().upper()
+                st.session_state["runtime_defaults"][code] = new_cat_hours.strip()
+                st.success(f"Added/Updated category {code}")
+
+    if st.button("Save category edits", key="save_cat_edits"):
+        for k, v in edited.items():
+            if v is not None:
                 st.session_state["runtime_defaults"][k] = v.strip()
-            st.success("Saved category timings to session state.")
-
-# build runtime defaults (fall back to session_state or DEFAULT_WORKING_HOURS)
-_runtime_defaults = DEFAULT_WORKING_HOURS.copy()
-if "runtime_defaults" in st.session_state:
-    _runtime_defaults = {**_runtime_defaults, **st.session_state.get("runtime_defaults", {})}
-# expose runtime_defaults with a simple name for existing code
-runtime_defaults = _runtime_defaults
+        st.success("Saved category timings.")
 
 
-st.markdown("#### B — Shift computation (single/manual + bulk)")
+# Shift computation subsection
+st.markdown("#### Shift computation")
+st.caption("Compute shifts either via Bulk Upload or Single/manual entry.")
 
 # --- Sub-navigation: two tabs to match requested layout ---------------------
 sub_tabs = st.tabs(["📥 Bulk Upload", "✍️ Single Branch (manual)"])
 
 # Bulk tab (index 0)
 with sub_tabs[0]:
-    st.markdown("#### Bulk upload (assign shifts & auto-compute start/end times)")
+    st.markdown("##### Bulk upload (assign shifts & auto-compute start/end times)")
     st.caption("Upload a sheet with at least: First Bell Time, Category (PP/APP/L) and optional per-row working hours. The sheet can also include Employee ID/Name/Designation.")
 
     with st.container():
@@ -320,7 +331,7 @@ with sub_tabs[0]:
                 detected = detect_columns(cols)
                 required_found = detected.get("first_bell") and detected.get("category")
 
-                st.markdown("##### Column mapping")
+                st.markdown("###### Column mapping")
                 if required_found:
                     st.success("Required columns auto-detected: First Bell and Category. Mapping will be applied automatically.")
                     # show detected mapping in compact way and allow override
@@ -415,7 +426,7 @@ with sub_tabs[0]:
 
 # Single/manual tab (index 1)
 with sub_tabs[1]:
-    st.markdown("#### Single / Manual shift compute")
+    st.markdown("##### Single / Manual shift compute")
     with st.expander("Compute a single shift from First Bell", expanded=True):
         col1, col2, col3 = st.columns(3)
         with col1:
