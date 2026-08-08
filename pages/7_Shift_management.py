@@ -48,6 +48,7 @@ DEFAULT_WORKING_HOURS = {
     "L": "8:15",  # Leader
 }
 
+# fixed buffer rule (15 minutes) — not exposed in the UI
 BUFFER_MINUTES = 15
 
 
@@ -112,7 +113,7 @@ def _parse_time_to_time(v) -> time:
             return datetime.strptime(text, fmt).time()
         except Exception:
             continue
-    # try pandas
+    # try pandas parsing
     try:
         ts = pd.to_datetime(text, errors="coerce")
         if pd.notna(ts):
@@ -143,8 +144,8 @@ def split_assigned_shift(s: str):
         return None, None
     if "-" in text:
         a, b = text.split("-", 1)
-    elif " to " in text:
-        a, b = text.split(" to ", 1)
+    elif " to " in text.lower():
+        a, b = text.lower().split(" to ", 1)
     else:
         return None, None
     ta = _parse_time_to_time(a.strip())
@@ -153,6 +154,7 @@ def split_assigned_shift(s: str):
 
 
 # --- Helpers for storing masters in session state ---------------------------------
+
 
 def _ensure_masters():
     if "shift_categories" not in st.session_state:
@@ -180,7 +182,11 @@ if page == "Category & Shift Master":
     with col1:
         st.subheader("Categories (code -> default working hours HH:MM)")
         cat_df = pd.DataFrame([{"Category": k, "Default Hours": v} for k, v in st.session_state["shift_categories"].items()])
-        edited = st.data_editor(cat_df, use_container_width=True) if hasattr(st, "data_editor") else st.dataframe(cat_df)
+        # use data_editor when available for inline edits, otherwise show dataframe
+        if hasattr(st, "data_editor"):
+            _ = st.data_editor(cat_df, use_container_width=True)
+        else:
+            st.dataframe(cat_df)
 
         st.markdown("**Add new category**")
         new_code = st.text_input("Category code (e.g. G1)", value="", key="new_cat_code")
@@ -213,7 +219,7 @@ if page == "Category & Shift Master":
         st.subheader("Named Shifts (label -> HH:MM-HH:MM)")
         nsh = st.session_state["named_shifts"]
         nsh_df = pd.DataFrame([{"Shift": k, "Assigned": v} for k, v in nsh.items()])
-        edited_shifts = st.dataframe(nsh_df, use_container_width=True)
+        st.dataframe(nsh_df, use_container_width=True)
 
         st.markdown("**Add new named shift**")
         new_shift_name = st.text_input("Shift name", value="", key="new_shift_name")
@@ -245,138 +251,162 @@ if page == "Category & Shift Master":
 
 else:
     st.markdown("### Bulk Shift Operations")
-    st.caption("Upload bulk assignments and validate/calculate shifts. The system will auto-detect required columns by name; no manual mapping is required.")
+    st.caption("Download the sample template, fill it, upload the file, then click Process to validate and generate the final result. No additional configuration is required on this page.")
 
-    st.markdown("#### Settings")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        first_bell = st.time_input("Default First Bell time (used to compute expected start)", value=time(8, 0), key="bulk_first_bell")
-        buffer_minutes = st.number_input("Buffer minutes before first bell", min_value=0, value=BUFFER_MINUTES, key="bulk_buffer")
-    with col_b:
-        st.info("Upload must contain ERP ID, Branch Name, Category and Current Assigned Shift (HH:MM-HH:MM). Column names are matched case-insensitively.")
+    # Sample template generator
+    def sample_bulk_template():
+        df = pd.DataFrame([
+            {"ERP ID": "12345678901", "Branch Name": "OIS Sample Branch", "Category": "Teacher", "First Bell Timing": "08:00", "Current Assigned Shift": "07:45-16:00"},
+            {"ERP ID": "12345678902", "Branch Name": "OIS Sample Branch", "Category": "Teacher", "First Bell Timing": "09:00", "Current Assigned Shift": "08:45-17:00"},
+            {"ERP ID": "12345678903", "Branch Name": "OIS Sample Branch", "Category": "Non-Teaching", "First Bell Timing": "08:30", "Current Assigned Shift": "08:15-16:30"},
+        ])
+        instr = pd.DataFrame({"Instructions": [
+            "Fill the 'ERP ID', 'Branch Name', 'Category', 'First Bell Timing' (HH:MM), and 'Current Assigned Shift' (HH:MM-HH:MM).",
+            "Do not change the column headers. The system auto-detects these columns case-insensitively.",
+            "First Bell Timing is used to compute the expected start (First Bell - 15 minutes) and expected end based on the category working hours.",
+        ]})
+        return {"Sample": df, "Instructions": instr}
 
-    uploaded = st.file_uploader("Upload bulk assignments (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="bulk_shifts")
+    if st.button("Download Sample File"):
+        try:
+            sheets = sample_bulk_template()
+            b = to_excel_bytes(sheets)
+            st.download_button("⬇️ Download sample bulk file", data=b, file_name="shift_bulk_sample.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as e:
+            st.error(safe_error_message(e, context="creating sample file"))
 
-    def auto_detect_columns(df: pd.DataFrame):
-        cols_lower = {c.lower(): c for c in df.columns}
-        mapping = {}
-        # ERP ID
-        for candidate in ["erp id", "erpid", "employee id", "employee_id", "id", "employeeid"]:
-            if candidate in cols_lower:
-                mapping["erp_id"] = cols_lower[candidate]
-                break
-        # Branch
-        for candidate in ["branch name", "branch", "branch_name"]:
-            if candidate in cols_lower:
-                mapping["branch"] = cols_lower[candidate]
-                break
-        # Category
-        for candidate in ["category", "cat"]:
-            if candidate in cols_lower:
-                mapping["category"] = cols_lower[candidate]
-                break
-        # Assigned shift
-        for candidate in ["current assigned shift", "assigned shift", "assigned_shift", "shift", "current shift", "current_assigned_shift"]:
-            if candidate in cols_lower:
-                mapping["assigned"] = cols_lower[candidate]
-                break
-        return mapping
-
+    uploaded = st.file_uploader("Upload completed bulk file (.xlsx or .csv)", type=["xlsx", "xls", "csv"], key="bulk_shifts")
     if uploaded:
         try:
             df = read_any_table(uploaded)
-            st.write(f"Loaded {len(df)} rows. Detected columns: {list(df.columns)}")
+            st.markdown("#### Preview of uploaded data (first 10 rows)")
+            st.dataframe(df.head(10), use_container_width=True)
+
+            def auto_detect_columns(df: pd.DataFrame):
+                cols_lower = {c.lower(): c for c in df.columns}
+                mapping = {}
+                # ERP ID
+                for candidate in ["erp id", "erpid", "employee id", "employee_id", "id", "employeeid"]:
+                    if candidate in cols_lower:
+                        mapping["erp_id"] = cols_lower[candidate]
+                        break
+                # Branch
+                for candidate in ["branch name", "branch", "branch_name"]:
+                    if candidate in cols_lower:
+                        mapping["branch"] = cols_lower[candidate]
+                        break
+                # Category
+                for candidate in ["category", "cat"]:
+                    if candidate in cols_lower:
+                        mapping["category"] = cols_lower[candidate]
+                        break
+                # First Bell Timing
+                for candidate in ["first bell timing", "first bell", "first_bell_timing", "first_bell"]:
+                    if candidate in cols_lower:
+                        mapping["first_bell"] = cols_lower[candidate]
+                        break
+                # Assigned shift
+                for candidate in ["current assigned shift", "assigned shift", "assigned_shift", "shift", "current shift", "current_assigned_shift"]:
+                    if candidate in cols_lower:
+                        mapping["assigned"] = cols_lower[candidate]
+                        break
+                return mapping
+
             mapping = auto_detect_columns(df)
-            missing = [k for k in ("erp_id", "branch", "category", "assigned") if k not in mapping]
+            missing = [k for k in ("erp_id", "branch", "category", "first_bell", "assigned") if k not in mapping]
             if missing:
                 st.error(f"Missing required columns (auto-detect failed): {missing}. Please ensure the uploaded sheet has these columns with recognizable names.")
             else:
-                # validate ERP ID and parse assigned shift
-                out_rows = []
-                for i, row in df.iterrows():
-                    raw_erp = row[mapping["erp_id"]]
-                    erp_str = str(raw_erp).strip() if pd.notna(raw_erp) else ""
-                    # ERP must be 11 digits
-                    erp_valid = False
-                    if erp_str.isdigit() and len(erp_str) == 11:
-                        erp_valid = True
-                    branch = row[mapping["branch"]]
-                    category = row[mapping["category"]]
-                    assigned = row[mapping["assigned"]]
-                    a_start, a_end = split_assigned_shift(assigned)
-                    assigned_working = None
-                    if a_start and a_end:
-                        dt_start = datetime.combine(date.today(), a_start)
-                        dt_end = datetime.combine(date.today(), a_end)
-                        if dt_end < dt_start:
-                            dt_end += timedelta(days=1)
-                        assigned_working = dt_end - dt_start
-                    # system-calculated expected start = first_bell - buffer
-                    expected_start_time = (datetime.combine(date.today(), first_bell) - timedelta(minutes=buffer_minutes)).time()
-                    # determine duration from category master or default
-                    cat_hours = st.session_state["shift_categories"].get(str(category).strip(), None)
-                    if cat_hours is None:
-                        cat_hours = DEFAULT_WORKING_HOURS.get(str(category).strip(), None)
-                    duration_td = parse_duration_to_timedelta(cat_hours) if cat_hours else None
-                    expected_end_time = None
-                    expected_working = None
-                    if duration_td is not None:
-                        es_dt = datetime.combine(date.today(), expected_start_time)
-                        ee_dt = es_dt + duration_td
-                        expected_end_time = ee_dt.time()
-                        expected_working = duration_td
-                    # compare
-                    status = "Unknown"
-                    notes = []
-                    if not erp_valid:
-                        status = "Invalid ERP"
-                        notes.append("ERP must be 11 digits")
-                    elif a_start is None or a_end is None:
-                        status = "Bad Assigned Shift Format"
-                        notes.append("Assigned shift must be HH:MM-HH:MM")
-                    else:
-                        # compare assigned start vs expected start within buffer tolerance (allow +/- buffer?)
-                        # we'll compute difference in minutes
-                        diff_start = (datetime.combine(date.today(), a_start) - datetime.combine(date.today(), expected_start_time)).total_seconds() / 60.0
-                        diff_end = None
-                        if expected_end_time:
-                            diff_end = (datetime.combine(date.today(), a_end) - datetime.combine(date.today(), expected_end_time)).total_seconds() / 60.0
-                        # treat a match if both diffs are within 5 minutes
-                        tol_minutes = 5
-                        if expected_working is None:
-                            status = "No Expected (no category duration)"
+                if st.button("Process / Validate"):
+                    out_rows = []
+                    for i, row in df.iterrows():
+                        erp_val = row[mapping["erp_id"]]
+                        erp_str = str(erp_val).strip() if pd.notna(erp_val) else ""
+                        branch = row[mapping["branch"]]
+                        category = row[mapping["category"]]
+                        first_bell_raw = row[mapping["first_bell"]]
+                        fb_time = _parse_time_to_time(first_bell_raw)
+                        assigned = row[mapping["assigned"]]
+
+                        a_start, a_end = split_assigned_shift(assigned)
+                        current_working = None
+                        if a_start and a_end:
+                            dt_start = datetime.combine(date.today(), a_start)
+                            dt_end = datetime.combine(date.today(), a_end)
+                            if dt_end < dt_start:
+                                dt_end += timedelta(days=1)
+                            current_working = dt_end - dt_start
+
+                        # System expected start = first_bell - BUFFER_MINUTES
+                        expected_start_time = None
+                        expected_end_time = None
+                        expected_working = None
+                        if fb_time:
+                            expected_start_dt = datetime.combine(date.today(), fb_time) - timedelta(minutes=BUFFER_MINUTES)
+                            expected_start_time = expected_start_dt.time()
+                            # duration from category master
+                            cat_hours = st.session_state["shift_categories"].get(str(category).strip(), None)
+                            if cat_hours is None:
+                                cat_hours = DEFAULT_WORKING_HOURS.get(str(category).strip(), None)
+                            duration_td = parse_duration_to_timedelta(cat_hours) if cat_hours else None
+                            if duration_td is not None:
+                                ee_dt = expected_start_dt + duration_td
+                                expected_end_time = ee_dt.time()
+                                expected_working = duration_td
+
+                        # compare
+                        status = "To Be Checked"
+                        notes = []
+                        if a_start is None or a_end is None:
+                            status = "To Be Checked"
+                            notes.append("Bad Assigned Shift Format")
+                        elif fb_time is None:
+                            status = "To Be Checked"
+                            notes.append("Missing/invalid First Bell Timing")
+                        elif expected_working is None:
+                            status = "To Be Checked"
                             notes.append("No duration configured for category")
                         else:
+                            # compute diffs
+                            diff_start = (datetime.combine(date.today(), a_start) - datetime.combine(date.today(), expected_start_time)).total_seconds() / 60.0
+                            diff_end = (datetime.combine(date.today(), a_end) - datetime.combine(date.today(), expected_end_time)).total_seconds() / 60.0
+                            tol_minutes = 5
                             if abs(diff_start) <= tol_minutes and abs(diff_end) <= tol_minutes:
-                                status = "Match"
+                                status = "Shift Matching"
                             else:
-                                status = "Mismatch"
+                                status = "To Be Checked"
                                 notes.append(f"Start Δ {diff_start:.0f} min, End Δ {diff_end:.0f} min")
-                    out_rows.append({
-                        "ERP ID": erp_str,
-                        "ERP Valid": erp_valid,
-                        "Branch": branch,
-                        "Category": category,
-                        "Assigned Start": a_start.strftime("%H:%M") if a_start else "",
-                        "Assigned End": a_end.strftime("%H:%M") if a_end else "",
-                        "Assigned Working Hours": format_timedelta(assigned_working) if assigned_working else "",
-                        "Expected Start": expected_start_time.strftime("%H:%M") if expected_start_time else "",
-                        "Expected End": expected_end_time.strftime("%H:%M") if expected_end_time else "",
-                        "Expected Working Hours": format_timedelta(expected_working) if expected_working else "",
-                        "Status": status,
-                        "Notes": "; ".join(notes),
-                    })
-                out_df = pd.DataFrame(out_rows)
-                st.markdown("#### Validation Results")
-                st.dataframe(out_df, use_container_width=True, height=400)
-                # show exceptions
-                exceptions = out_df[out_df["Status"] != "Match"]
-                st.markdown(f"**Exceptions: {len(exceptions)} row(s)**")
-                if not exceptions.empty:
-                    st.dataframe(exceptions, use_container_width=True, height=300)
-                # allow download
-                download_button_for_df(out_df, "⬇️ Download validation results", "shift_bulk_validation_results.xlsx")
+
+                        out_rows.append({
+                            "ERP ID": erp_str,
+                            "Branch Name": branch,
+                            "Category": category,
+                            "First Bell Timing": fb_time.strftime("%H:%M") if fb_time else "",
+                            "Current Assigned Shift": str(assigned),
+                            "Current Start Time": a_start.strftime("%H:%M") if a_start else "",
+                            "Current End Time": a_end.strftime("%H:%M") if a_end else "",
+                            "Current Working Hours": format_timedelta(current_working) if current_working else "",
+                            "System Calculated Shift": (f"{expected_start_time.strftime('%H:%M')}-{expected_end_time.strftime('%H:%M')}" if expected_start_time and expected_end_time else ""),
+                            "System Start Time": expected_start_time.strftime("%H:%M") if expected_start_time else "",
+                            "System End Time": expected_end_time.strftime("%H:%M") if expected_end_time else "",
+                            "System Working Hours": format_timedelta(expected_working) if expected_working else "",
+                            "Remarks": "; ".join(notes) if notes else status,
+                        })
+
+                    out_df = pd.DataFrame(out_rows)
+                    st.markdown("#### Final Result")
+                    st.dataframe(out_df, use_container_width=True, height=600)
+                    # show counts
+                    st.markdown(f"**Total rows:** {len(out_df)}; **To Be Checked:** {len(out_df[out_df['Remarks'] != 'Shift Matching'])}")
+
+                    # final download
+                    try:
+                        b = to_excel_bytes({"Processed_Result": out_df})
+                        st.download_button("⬇️ Download final processed file", data=b, file_name="shift_bulk_processed.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    except Exception as e:
+                        st.error(safe_error_message(e, context="creating final download"))
+
         except Exception as e:
-            st.error(safe_error_message(e, context="processing bulk shifts"))
+            st.error(safe_error_message(e, context="processing bulk upload"))
 
 
