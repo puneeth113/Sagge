@@ -354,28 +354,23 @@ else:
                                 expected_end_time = ee_dt.time()
                                 expected_working = duration_td
 
-                        # compare
-                        status = "To Be Checked"
-                        notes = []
+                        # compare and build clear remarks
+                        remarks = "To Be Checked"
                         if a_start is None or a_end is None:
-                            status = "To Be Checked"
-                            notes.append("Bad Assigned Shift Format")
+                            remarks = "Assigned shift format invalid"
                         elif fb_time is None:
-                            status = "To Be Checked"
-                            notes.append("Missing/invalid First Bell Timing")
+                            remarks = "Missing/invalid First Bell Timing"
                         elif expected_working is None:
-                            status = "To Be Checked"
-                            notes.append("No duration configured for category")
+                            remarks = "No duration configured for category"
                         else:
                             # compute diffs
                             diff_start = (datetime.combine(date.today(), a_start) - datetime.combine(date.today(), expected_start_time)).total_seconds() / 60.0
                             diff_end = (datetime.combine(date.today(), a_end) - datetime.combine(date.today(), expected_end_time)).total_seconds() / 60.0
                             tol_minutes = 5
                             if abs(diff_start) <= tol_minutes and abs(diff_end) <= tol_minutes:
-                                status = "Shift Matching"
+                                remarks = "Assigned shift matches computed shift"
                             else:
-                                status = "To Be Checked"
-                                notes.append(f"Start Δ {diff_start:.0f} min, End Δ {diff_end:.0f} min")
+                                remarks = f"Assigned shift does not match computed shift (Start Δ {diff_start:.0f} min, End Δ {diff_end:.0f} min)"
 
                         out_rows.append({
                             "ERP ID": erp_str,
@@ -390,14 +385,14 @@ else:
                             "System Start Time": expected_start_time.strftime("%H:%M") if expected_start_time else "",
                             "System End Time": expected_end_time.strftime("%H:%M") if expected_end_time else "",
                             "System Working Hours": format_timedelta(expected_working) if expected_working else "",
-                            "Remarks": "; ".join(notes) if notes else status,
+                            "Remarks": remarks,
                         })
 
                     out_df = pd.DataFrame(out_rows)
                     st.markdown("#### Final Result")
                     st.dataframe(out_df, use_container_width=True, height=600)
                     # show counts
-                    st.markdown(f"**Total rows:** {len(out_df)}; **To Be Checked:** {len(out_df[out_df['Remarks'] != 'Shift Matching'])}")
+                    st.markdown(f"**Total rows:** {len(out_df)}; **To Be Checked:** {len(out_df[out_df['Remarks'] != 'Assigned shift matches computed shift'])}")
 
                     # final download
                     try:
@@ -408,5 +403,3 @@ else:
 
         except Exception as e:
             st.error(safe_error_message(e, context="processing bulk upload"))
-
-
