@@ -26,15 +26,15 @@ def hide_default_sidebar_nav():
     )
 
 
+# NOTE: keep this in sync with the actual files under pages/. Every entry
+# here becomes a st.page_link() call in render_top_nav() below - an entry
+# pointing at a file that doesn't exist will raise an error, and an active
+# page missing from this list simply won't get a nav link.
 PAGES = [
     {"path": "Home.py", "label": "Home", "icon": "🗂️"},
     {"path": "pages/1_Long_Absence_Tracker.py", "label": "Long Absence Tracker", "icon": "📅"},
-    {"path": "pages/2_Incentive_Validator.py", "label": "Incentive Validator", "icon": "💰"},
     {"path": "pages/3_Payroll_Calculator.py", "label": "Payroll Calculator", "icon": "🧾"},
-    {"path": "pages/4_Gratuity_and_Advance.py", "label": "Gratuity & Advance", "icon": "🏦"},
-    {"path": "pages/5_Maternity_Payment.py", "label": "Maternity Payment", "icon": "🤱"},
-    {"path": "pages/5_Paysheet_Operations.py", "label": "Paysheet Operations", "icon": "📥"},
-    {"path": "pages/6_Task_Manager.py", "label": "Task Manager", "icon": "✅"},
+    {"path": "pages/4_Employee_Database.py", "label": "Employee Database", "icon": "👥"},
     {"path": "pages/7_Shift_management.py", "label": "Shift Management", "icon": "🕒"},
 ]
 
@@ -256,89 +256,7 @@ DEFAULT_ABSENCE_THRESHOLDS = [
 
 
 # --------------------------------------------------------------------------
-# 2. Incentive Validator (Bulk Upload)
-# --------------------------------------------------------------------------
-
-INCENTIVE_TEMPLATE_COLUMNS = [
-    "Branch Name",
-    "Bus Maid Count",
-    "Washroom Maid Count",
-    "Max Washroom Incentive",
-    "Max Bus Incentive",
-]
-
-
-def sample_incentive_template() -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "Branch Name": "Koramangala",
-                "Bus Maid Count": 4,
-                "Washroom Maid Count": 6,
-                "Max Washroom Incentive": 3000,
-                "Max Bus Incentive": 2000,
-            },
-            {
-                "Branch Name": "Whitefield",
-                "Bus Maid Count": 2,
-                "Washroom Maid Count": 5,
-                "Max Washroom Incentive": 2500,
-                "Max Bus Incentive": 1500,
-            },
-        ]
-    )
-
-
-def compute_incentives(
-    df: pd.DataFrame,
-    rate_per_washroom_maid: float,
-    rate_per_bus_maid: float,
-) -> pd.DataFrame:
-    """Computes incentive per branch as:
-        Washroom Incentive = min(Washroom Maid Count * rate, Max Washroom Incentive)
-        Bus Incentive       = min(Bus Maid Count * rate, Max Bus Incentive)
-        Total Incentive     = Washroom Incentive + Bus Incentive
-
-    NOTE: The exact incentive formula was not specified in this session, so
-    a standard "per-maid rate capped at branch max" logic is used. Adjust
-    `rate_per_washroom_maid` / `rate_per_bus_maid` in the sidebar, or edit
-    this function directly if your actual policy differs (e.g. slab-based
-    instead of linear-per-maid).
-    """
-    out = df.copy()
-
-    for col in INCENTIVE_TEMPLATE_COLUMNS:
-        if col not in out.columns:
-            raise ValueError(f"Missing required column: '{col}'")
-
-    out["Calculated Washroom Incentive"] = (
-        out["Washroom Maid Count"] * rate_per_washroom_maid
-    ).clip(upper=None)
-    out["Calculated Washroom Incentive"] = out[
-        ["Calculated Washroom Incentive", "Max Washroom Incentive"]
-    ].min(axis=1)
-
-    out["Calculated Bus Incentive"] = out["Bus Maid Count"] * rate_per_bus_maid
-    out["Calculated Bus Incentive"] = out[
-        ["Calculated Bus Incentive", "Max Bus Incentive"]
-    ].min(axis=1)
-
-    out["Total Incentive"] = (
-        out["Calculated Washroom Incentive"] + out["Calculated Bus Incentive"]
-    )
-
-    out["Capped? (Washroom)"] = (
-        out["Washroom Maid Count"] * rate_per_washroom_maid
-    ) > out["Max Washroom Incentive"]
-    out["Capped? (Bus)"] = (out["Bus Maid Count"] * rate_per_bus_maid) > out[
-        "Max Bus Incentive"
-    ]
-
-    return out
-
-
-# --------------------------------------------------------------------------
-# 3. Payroll: Full-time employees (PF + ESIC) & Gig workers (TDS)
+# 2. Payroll: Full-time employees (PF + ESIC) & Gig workers (TDS)
 # --------------------------------------------------------------------------
 
 def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.Series:
@@ -500,7 +418,7 @@ def compute_gig_worker_billing(
 
 
 # --------------------------------------------------------------------------
-# 4. Gross <-> In-Hand converters
+# 3. Gross <-> In-Hand converters
 # --------------------------------------------------------------------------
 
 def solve_gross_for_net_fulltime(
@@ -588,98 +506,3 @@ def gig_billing_to_inhand(billing_amount: float, tds_pct: float = 1.0) -> dict:
         "TDS Amount": billing_amount - inhand,
         "In-Hand Amount": inhand,
     }
-
-
-# --------------------------------------------------------------------------
-# 5. Gratuity Calculator
-# --------------------------------------------------------------------------
-
-def compute_years_of_service(doj, dol, round_half_year_up: bool = True) -> float:
-    """Completed years of service between Date of Joining and Date of
-    Leaving (or 'as of' date). Uses the standard gratuity rounding rule:
-    if the leftover period beyond completed full years is 6 months or
-    more, round up to the next full year; otherwise it's dropped.
-    `doj` and `dol` should be datetime.date / datetime.datetime objects.
-    """
-    total_days = (dol - doj).days
-    total_years = total_days / 365.25
-    completed_years = int(total_years)
-    remainder = total_years - completed_years
-    if round_half_year_up and remainder >= 0.5:
-        completed_years += 1
-    return completed_years
-
-
-def compute_gratuity(
-    last_drawn_basic_da: float,
-    years_of_service: float,
-    covered_under_act: bool = True,
-    min_years_for_eligibility: float = 5,
-    exempt_from_min_years: bool = False,
-    max_limit: float = 2000000,
-) -> dict:
-    """Statutory gratuity calculation under the Payment of Gratuity Act, 1972.
-
-        Gratuity = (Last Drawn Basic+DA x 15 x Years of Service) / 26   [covered establishments]
-        Gratuity = (Last Drawn Basic+DA x 15 x Years of Service) / 30   [non-covered, common practice]
-
-    Eligibility normally requires 5+ years of continuous service, except
-    in cases of death or disablement (`exempt_from_min_years=True`).
-
-    `max_limit` is the statutory tax-exemption ceiling — verify the
-    current limit before relying on this for compliance, as it can change
-    (₹20,00,000 was the limit at last update, used as the default here).
-
-    NOTE: this is a standard-case calculator. It does not account for
-    every edge case in the Act (e.g. seasonal establishments use a
-    different divisor, some awards/settlements override the formula).
-    Confirm with your compliance team for non-standard cases.
-    """
-    eligible = exempt_from_min_years or years_of_service >= min_years_for_eligibility
-    divisor = 26 if covered_under_act else 30
-
-    if not eligible:
-        return {
-            "Eligible": False,
-            "Years of Service": years_of_service,
-            "Gratuity (Uncapped)": 0.0,
-            "Gratuity Payable": 0.0,
-            "Capped": False,
-            "Note": f"Not eligible — requires {min_years_for_eligibility}+ years of service "
-                    f"(unless death/disablement exemption applies).",
-        }
-
-    gratuity_raw = (last_drawn_basic_da * 15 * years_of_service) / divisor
-    gratuity_capped = min(gratuity_raw, max_limit)
-
-    return {
-        "Eligible": True,
-        "Years of Service": years_of_service,
-        "Gratuity (Uncapped)": round(gratuity_raw, 2),
-        "Statutory Max Limit": max_limit,
-        "Gratuity Payable": round(gratuity_capped, 2),
-        "Capped": gratuity_raw > max_limit,
-        "Note": "",
-    }
-
-
-# --------------------------------------------------------------------------
-# 6. ERP/OIS-based Paysheet Lookup (for Salary Advance processing)
-# --------------------------------------------------------------------------
-
-def validate_erp_id(erp_id: str, expected_length: int = 11) -> bool:
-    """Validates an ERP/OIS employee code: must be all digits and exactly
-    `expected_length` characters long (default 11, per the stated format)."""
-    if erp_id is None:
-        return False
-    cleaned = str(erp_id).strip()
-    return cleaned.isdigit() and len(cleaned) == expected_length
-
-
-def lookup_employee_by_erp(df: pd.DataFrame, erp_col: str, erp_id: str) -> pd.DataFrame:
-    """Returns all rows in `df` whose `erp_col` value matches `erp_id`
-    exactly (compared as trimmed strings, so numeric-vs-text formatting
-    differences in the source sheet don't cause false misses)."""
-    target = str(erp_id).strip()
-    matches = df[df[erp_col].astype(str).str.strip() == target]
-    return matches
