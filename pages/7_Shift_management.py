@@ -190,6 +190,43 @@ def _get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 
+def _migrate_old_single_key_schema(conn):
+    """One-time upgrade for databases created by an earlier version of this
+    page, where (branch_name) alone was the primary key. That bug meant
+    saving a second category for the same branch silently overwrote the
+    first one. This copies whatever survived into the new, correct table
+    keyed on (branch_name, category).
+    """
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(branch_start_times)")
+    cols = cur.fetchall()
+    if not cols:
+        return  # table doesn't exist yet, nothing to migrate
+    pk_cols = [c[1] for c in cols if c[5] > 0]  # column name where pk index > 0
+    if pk_cols == ["branch_name", "category"]:
+        return  # already on the new schema
+    # Old schema detected (pk is just branch_name) - rename, recreate, copy over.
+    cur.execute("ALTER TABLE branch_start_times RENAME TO branch_start_times_old")
+    cur.execute(
+        """
+        CREATE TABLE branch_start_times (
+            branch_name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            PRIMARY KEY (branch_name, category)
+        )
+        """
+    )
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO branch_start_times (branch_name, category, start_time)
+        SELECT branch_name, category, start_time FROM branch_start_times_old
+        """
+    )
+    cur.execute("DROP TABLE branch_start_times_old")
+    conn.commit()
+
+
 def init_db():
     conn = _get_conn()
     try:
@@ -197,29 +234,44 @@ def init_db():
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS branch_start_times (
-                branch_name TEXT PRIMARY KEY,
+                branch_name TEXT NOT NULL,
                 category TEXT NOT NULL,
-                start_time TEXT NOT NULL
+                start_time TEXT NOT NULL,
+                PRIMARY KEY (branch_name, category)
             )
             """
         )
         conn.commit()
+        _migrate_old_single_key_schema(conn)
     finally:
         conn.close()
 
 
 def load_branch_start_times() -> dict:
+    """Returns a nested dict: {branch_name: {category: start_time_str}}.
+
+    A branch can have a different start time per category (e.g. PP starts
+    at 08:00 but L starts at 08:30 at the same branch), so both the branch
+    name AND the category together identify a row.
+    """
     conn = _get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT branch_name, category, start_time FROM branch_start_times ORDER BY branch_name")
+        cur.execute("SELECT branch_name, category, start_time FROM branch_start_times ORDER BY branch_name, category")
         rows = cur.fetchall()
     finally:
         conn.close()
-    return {r[0]: {"Category": r[1], "Start Time": r[2]} for r in rows}
+    result: dict = {}
+    for branch_name, category, start_time in rows:
+        result.setdefault(branch_name, {})[category] = start_time
+    return result
 
 
 def upsert_branch_start_time(branch_name: str, category: str, start_time: str):
+    """Insert or update the start time for one (branch, category) pair.
+    Saving a new category for a branch that already exists adds a new row
+    rather than overwriting the branch's other categories.
+    """
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -227,8 +279,7 @@ def upsert_branch_start_time(branch_name: str, category: str, start_time: str):
             """
             INSERT INTO branch_start_times (branch_name, category, start_time)
             VALUES (?, ?, ?)
-            ON CONFLICT(branch_name) DO UPDATE SET
-                category = excluded.category,
+            ON CONFLICT(branch_name, category) DO UPDATE SET
                 start_time = excluded.start_time
             """,
             (branch_name, category, start_time),
@@ -238,11 +289,19 @@ def upsert_branch_start_time(branch_name: str, category: str, start_time: str):
         conn.close()
 
 
-def delete_branch_start_time(branch_name: str):
+def delete_branch_start_time(branch_name: str, category: str = None):
+    """Deletes one (branch, category) row, or every row for a branch if
+    category is omitted."""
     conn = _get_conn()
     try:
         cur = conn.cursor()
-        cur.execute("DELETE FROM branch_start_times WHERE branch_name = ?", (branch_name,))
+        if category is None:
+            cur.execute("DELETE FROM branch_start_times WHERE branch_name = ?", (branch_name,))
+        else:
+            cur.execute(
+                "DELETE FROM branch_start_times WHERE branch_name = ? AND category = ?",
+                (branch_name, category),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -393,14 +452,23 @@ if page == "Category & Shift Master":
 
         st.markdown("Current branch start master (stored in database)")
         bst = st.session_state["branch_start_times"]
-        bst_df = pd.DataFrame([{"Branch": k, "Category": v.get("Category"), "Start Time": v.get("Start Time")} for k, v in bst.items()])
+        # bst is nested: {branch_name: {category: start_time}} - a branch can
+        # have several rows, one per category, each with its own start time.
+        bst_rows = [
+            {"Branch": branch, "Category": category, "Start Time": start_time}
+            for branch, cat_map in bst.items()
+            for category, start_time in cat_map.items()
+        ]
+        bst_df = pd.DataFrame(bst_rows)
         st.dataframe(bst_df, use_container_width=True)
 
-        if bst:
-            del_branch = st.selectbox("Select a branch to delete", options=list(bst.keys()), key="del_branch_select")
-            if st.button("Delete selected branch"):
-                delete_branch_start_time(del_branch)
-                st.success(f"Deleted branch {del_branch} from the database")
+        if bst_rows:
+            row_labels = [f"{r['Branch']} — {r['Category']} ({r['Start Time']})" for r in bst_rows]
+            del_choice = st.selectbox("Select a branch + category entry to delete", options=row_labels, key="del_branch_select")
+            if st.button("Delete selected entry"):
+                chosen = bst_rows[row_labels.index(del_choice)]
+                delete_branch_start_time(chosen["Branch"], chosen["Category"])
+                st.success(f"Deleted {chosen['Branch']} ({chosen['Category']}) from the database")
                 _rerun()
 
     with col2:
@@ -527,9 +595,13 @@ else:
                         expected_end_time = None
                         expected_working = None
                         bst = st.session_state.get("branch_start_times", {})
-                        br_info = bst.get(branch)
-                        if br_info:
-                            bst_time = _parse_time_to_time(br_info.get("Start Time"))
+                        # bst is nested: {branch_name: {category: start_time}} - look up
+                        # the start time for THIS branch's THIS category specifically,
+                        # since the same branch can have a different start time per category.
+                        branch_categories = bst.get(branch, {})
+                        raw_start_time = branch_categories.get(category)
+                        if raw_start_time:
+                            bst_time = _parse_time_to_time(raw_start_time)
                             if bst_time:
                                 expected_start_time = bst_time
                                 # duration from category master
@@ -546,8 +618,8 @@ else:
                         remarks = "To Be Checked"
                         if a_start is None or a_end is None:
                             remarks = "Assigned shift format invalid"
-                        elif br_info is None:
-                            remarks = "Missing branch start master entry"
+                        elif raw_start_time is None:
+                            remarks = "Missing branch start master entry for this branch + category"
                         elif expected_working is None:
                             remarks = "No duration configured for category"
                         else:
