@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import importlib.util
 from datetime import datetime, date, timedelta, time
 
@@ -41,12 +42,28 @@ st.title("🕒 Shift Management")
 st.caption("Category master and bulk shift operations. Use the masters to configure categories, branch start times and named shifts, then run bulk processing to validate and update assignments.")
 
 
-# Default working hours per category (HH:MM)
+# Default working hours per category (HH:MM). These figures already include
+# whatever fixed daily allowance (e.g. break time) applies to that category -
+# there is no separate buffer subtracted anywhere else in this file.
 DEFAULT_WORKING_HOURS = {
     "PP": "6:15",  # Preprimary
     "APP": "6:45",  # Above Primary
     "L": "8:15",  # Leader
 }
+
+# Tolerance (in minutes) used only when comparing an employee's currently
+# assigned shift against the system-computed shift, to decide whether they
+# should be flagged as "matches" or "does not match". This has nothing to do
+# with how the working hours / expected end time are computed.
+MATCH_TOLERANCE_MINUTES = 5
+
+
+def _rerun():
+    """Compat wrapper: st.rerun() on newer Streamlit, falls back on older ones."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
 
 def parse_duration_to_timedelta(s: str) -> timedelta:
@@ -150,6 +167,90 @@ def split_assigned_shift(s: str):
     return ta, tb
 
 
+# --- Persistent storage (SQLite) for branch start times ---------------------------
+#
+# Branch start times are the one master that needs to survive app restarts so
+# users don't have to re-upload the sheet every session. Everything lives in a
+# small local SQLite database file next to the app - no other files are
+# touched or required.
+
+
+def _get_db_path() -> str:
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    root_dir = os.path.dirname(this_dir)
+    data_dir = os.path.join(root_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "shift_management.db")
+
+
+DB_PATH = _get_db_path()
+
+
+def _get_conn():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db():
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS branch_start_times (
+                branch_name TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                start_time TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_branch_start_times() -> dict:
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT branch_name, category, start_time FROM branch_start_times ORDER BY branch_name")
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    return {r[0]: {"Category": r[1], "Start Time": r[2]} for r in rows}
+
+
+def upsert_branch_start_time(branch_name: str, category: str, start_time: str):
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO branch_start_times (branch_name, category, start_time)
+            VALUES (?, ?, ?)
+            ON CONFLICT(branch_name) DO UPDATE SET
+                category = excluded.category,
+                start_time = excluded.start_time
+            """,
+            (branch_name, category, start_time),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_branch_start_time(branch_name: str):
+    conn = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM branch_start_times WHERE branch_name = ?", (branch_name,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+init_db()
+
+
 # --- Helpers for storing masters in session state ---------------------------------
 
 
@@ -163,11 +264,9 @@ def _ensure_masters():
             "Standard A": "08:00-16:15",
             "Standard B": "07:45-16:00",
         }
-    if "branch_start_times" not in st.session_state:
-        # dict: branch_name -> {"Category": category_code, "Start Time": "08:00"}
-        st.session_state["branch_start_times"] = {
-            "OIS Sample Branch": {"Category": "PP", "Start Time": "08:00"},
-        }
+    # Branch start times always come from the database, so it survives
+    # app restarts and doesn't need to be re-uploaded each session.
+    st.session_state["branch_start_times"] = load_branch_start_times()
 
 
 _ensure_masters()
@@ -178,16 +277,13 @@ page = st.radio("Shift Management — Section", options=["Category & Shift Maste
 
 if page == "Category & Shift Master":
     st.markdown("### Category & Shift Master")
-    st.caption("Create / edit categories, named shifts, and upload/edit branch start times used by bulk operations.")
+    st.caption("Create / edit categories, named shifts, and manage branch start times used by bulk operations. Branch start times are saved permanently to the database, so you only need to upload them once.")
 
     col1, col2 = st.columns([2, 1])
     with col1:
         st.subheader("Categories (code -> default working hours HH:MM)")
         cat_df = pd.DataFrame([{"Category": k, "Default Hours": v} for k, v in st.session_state["shift_categories"].items()])
-        if hasattr(st, "data_editor"):
-            _ = st.data_editor(cat_df, use_container_width=True)
-        else:
-            st.dataframe(cat_df)
+        st.dataframe(cat_df, use_container_width=True)
 
         st.markdown("**Add new category**")
         new_code = st.text_input("Category code (e.g. G1)", value="", key="new_cat_code")
@@ -198,7 +294,7 @@ if page == "Category & Shift Master":
             else:
                 st.session_state["shift_categories"][new_code.strip()] = new_hours.strip()
                 st.success(f"Added category {new_code.strip()} -> {new_hours.strip()}")
-                st.experimental_rerun()
+                _rerun()
 
         st.markdown("**Edit existing category**")
         sel_cat = st.selectbox("Select category to edit", options=list(st.session_state["shift_categories"].keys()))
@@ -208,17 +304,21 @@ if page == "Category & Shift Master":
             if st.button("Save category", key=f"save_cat_{sel_cat}"):
                 st.session_state["shift_categories"][sel_cat] = new_val.strip()
                 st.success(f"Saved {sel_cat} -> {new_val.strip()}")
-                st.experimental_rerun()
+                _rerun()
 
         if st.button("Delete selected category"):
             if sel_cat in st.session_state["shift_categories"]:
                 del st.session_state["shift_categories"][sel_cat]
                 st.success(f"Deleted category {sel_cat}")
-                st.experimental_rerun()
+                _rerun()
 
         st.markdown("---")
         st.subheader("Branch start times (branch -> category, start time)")
-        st.markdown("Upload a small sheet with: Branch Name, Category, Start Time (HH:MM). This master is used to compute expected shifts for employees in that branch.")
+        st.markdown(
+            "Upload a sheet with: Branch Name, Category, Start Time (HH:MM), or add branches one at a time below. "
+            "Entries are saved permanently to the database - you won't need to re-upload them next time you open the app. "
+            "This master is used to compute the expected shift for employees in that branch."
+        )
 
         if st.button("Download sample branch start template"):
             try:
@@ -258,26 +358,50 @@ if page == "Category & Shift Master":
                 if missing:
                     st.error(f"Missing required columns in branch start upload: {missing}")
                 else:
-                    if st.button("Load branch starts into master"):
+                    if st.button("Save branch starts to database"):
+                        saved = 0
                         for i, r in bdf.iterrows():
                             br = str(r[mapping["branch"]]).strip()
                             cat = str(r[mapping["category"]]).strip()
                             stime = r[mapping["start_time"]]
                             t = _parse_time_to_time(stime)
-                            if t:
-                                st.session_state["branch_start_times"][br] = {"Category": cat, "Start Time": t.strftime("%H:%M")}
-                            else:
-                                st.session_state["branch_start_times"][br] = {"Category": cat, "Start Time": str(stime)}
-                        st.success("Loaded branch start times into master")
-                        st.experimental_rerun()
+                            start_time_str = t.strftime("%H:%M") if t else str(stime).strip()
+                            if br:
+                                upsert_branch_start_time(br, cat, start_time_str)
+                                saved += 1
+                        st.success(f"Saved {saved} branch start time(s) to the database")
+                        _rerun()
+            except Exception as e:
+                st.error(safe_error_message(e, context="reading branch start upload"))
 
-        st.markdown("Current branch start master")
+        st.markdown("**Add / update a single branch**")
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            single_branch = st.text_input("Branch name", value="", key="single_branch_name")
+        with bc2:
+            cat_options = list(st.session_state["shift_categories"].keys())
+            single_category = st.selectbox("Category", options=cat_options, key="single_branch_category") if cat_options else st.text_input("Category", key="single_branch_category_txt")
+        with bc3:
+            single_start = st.text_input("Start time (HH:MM)", value="08:00", key="single_branch_start")
+        if st.button("Save branch to database"):
+            if not single_branch.strip():
+                st.error("Provide a branch name.")
+            else:
+                upsert_branch_start_time(single_branch.strip(), str(single_category).strip(), single_start.strip())
+                st.success(f"Saved {single_branch.strip()} to the database")
+                _rerun()
+
+        st.markdown("Current branch start master (stored in database)")
         bst = st.session_state["branch_start_times"]
         bst_df = pd.DataFrame([{"Branch": k, "Category": v.get("Category"), "Start Time": v.get("Start Time")} for k, v in bst.items()])
-        if hasattr(st, "data_editor"):
-            _ = st.data_editor(bst_df, use_container_width=True)
-        else:
-            st.dataframe(bst_df)
+        st.dataframe(bst_df, use_container_width=True)
+
+        if bst:
+            del_branch = st.selectbox("Select a branch to delete", options=list(bst.keys()), key="del_branch_select")
+            if st.button("Delete selected branch"):
+                delete_branch_start_time(del_branch)
+                st.success(f"Deleted branch {del_branch} from the database")
+                _rerun()
 
     with col2:
         st.subheader("Named Shifts (label -> HH:MM-HH:MM)")
@@ -294,7 +418,7 @@ if page == "Category & Shift Master":
             else:
                 st.session_state["named_shifts"][new_shift_name.strip()] = new_shift_span.strip()
                 st.success(f"Added shift {new_shift_name.strip()} -> {new_shift_span.strip()}")
-                st.experimental_rerun()
+                _rerun()
 
         st.markdown("**Edit existing shift**")
         sel_shift = st.selectbox("Select shift to edit", options=list(nsh.keys()))
@@ -304,18 +428,18 @@ if page == "Category & Shift Master":
             if st.button("Save shift", key=f"save_shift_{sel_shift}"):
                 st.session_state["named_shifts"][sel_shift] = new_span.strip()
                 st.success(f"Saved {sel_shift} -> {new_span.strip()}")
-                st.experimental_rerun()
+                _rerun()
 
         if st.button("Delete selected shift"):
             if sel_shift in st.session_state["named_shifts"]:
                 del st.session_state["named_shifts"][sel_shift]
                 st.success(f"Deleted shift {sel_shift}")
-                st.experimental_rerun()
+                _rerun()
 
 
 else:
     st.markdown("### Bulk Shift Operations")
-    st.caption("Download the sample template, fill it, upload the file, then click Process to validate and generate the final result. This page uses the branch start master to compute expected shifts.")
+    st.caption("Download the sample template, fill it, upload the file, then click Process to validate and generate the final result. This page uses the saved branch start master to compute expected shifts.")
 
     # Sample template generator (no First Bell column anymore)
     def sample_bulk_template():
@@ -327,8 +451,8 @@ else:
         instr = pd.DataFrame({"Instructions": [
             "Fill the 'ERP ID', 'Branch Name', 'Category', and 'Current Assigned Shift' (HH:MM-HH:MM).",
             "Do not change the column headers. The system auto-detects these columns case-insensitively.",
-            "Branch start times are taken from the 'Category & Shift Master' -> Branch start times master (upload that first if needed).",
-            "The system uses the branch start time as the expected shift start and the category default hours to compute the expected end (no additional buffer subtraction).",
+            "Branch start times come from the 'Category & Shift Master' -> Branch start times master, saved permanently in the database (upload/add branches there once).",
+            "Expected end time = branch start time + the category's default working hours, taken directly with no separate buffer subtracted.",
         ]})
         return {"Sample": df, "Instructions": instr}
 
@@ -395,7 +519,10 @@ else:
                                 dt_end += timedelta(days=1)
                             current_working = dt_end - dt_start
 
-                        # System expected start = branch start (from master)
+                        # System expected start = branch start (from the saved database master).
+                        # Expected end = expected start + category's full default working hours.
+                        # The category hours already include any built-in allowance (e.g. the
+                        # ":15" in "6:15"), so no extra buffer is added or subtracted here.
                         expected_start_time = None
                         expected_end_time = None
                         expected_working = None
@@ -427,8 +554,7 @@ else:
                             # compute diffs
                             diff_start = (datetime.combine(date.today(), a_start) - datetime.combine(date.today(), expected_start_time)).total_seconds() / 60.0
                             diff_end = (datetime.combine(date.today(), a_end) - datetime.combine(date.today(), expected_end_time)).total_seconds() / 60.0
-                            tol_minutes = 5
-                            if abs(diff_start) <= tol_minutes and abs(diff_end) <= tol_minutes:
+                            if abs(diff_start) <= MATCH_TOLERANCE_MINUTES and abs(diff_end) <= MATCH_TOLERANCE_MINUTES:
                                 remarks = "Assigned shift matches computed shift"
                             else:
                                 remarks = f"Assigned shift does not match computed shift (Start Δ {diff_start:.0f} min, End Δ {diff_end:.0f} min)"
