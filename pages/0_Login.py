@@ -29,6 +29,24 @@ def _save_json(path: str, data):
         json.dump(data, f, indent=2)
 
 
+# Small helper to render a divider safely across Streamlit versions
+def safe_divider():
+    if hasattr(st, "divider"):
+        st.divider()
+    else:
+        st.markdown("---")
+
+
+# Hide the Streamlit sidebar (used on the login view to avoid the side page menu)
+def hide_sidebar():
+    css = """
+    <style>
+    section[data-testid="stSidebar"] {display: none;}
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+
 # Ensure users file exists with the requested admin account
 def ensure_initial_admin():
     users = _load_json(USERS_FILE, [])
@@ -55,6 +73,11 @@ st.title("🔐 Login")
 # --- load users & pending requests ---
 users = _load_json(USERS_FILE, [])
 pending = _load_json(PENDING_FILE, [])
+
+# If the user is not logged in, hide the sidebar menu so the login page is the main focus.
+# This removes the side-bar page view while on the login screen.
+if not st.session_state.get("logged_in"):
+    hide_sidebar()
 
 # Single form that can act as Login or Request Access to avoid ambiguity
 with st.form(key="main_form"):
@@ -98,11 +121,11 @@ if submitted:
             st.success("Your access request has been recorded and will be reviewed.")
 
 
-st.divider()
+safe_divider()
 
 # --- Admin approval UI ---
 if st.session_state.get("logged_in") and st.session_state.get("role") == "admin":
-    st.divider()
+    safe_divider()
     st.header("Pending access requests")
     if not pending:
         st.info("No pending requests.")
@@ -137,17 +160,17 @@ if st.session_state.get("logged_in") and st.session_state.get("role") == "admin"
 
 # If logged in, show quick link to Home
 if st.session_state.get("logged_in"):
-    st.divider()
+    safe_divider()
     st.success(f"Logged in as {st.session_state.get('user')}")
     # page_link may not exist in all Streamlit versions; guard to avoid AttributeError
     if hasattr(st, "page_link"):
         st.page_link("Home.py", label="Go to Home →", icon="🗂️")
     else:
         if st.button("Go to Home →"):
-            try:
-                # try to open the multipage page by setting query params (best-effort)
+            # best-effort: set query params if the API exists
+            if hasattr(st, "experimental_set_query_params"):
                 st.experimental_set_query_params(page="Home.py")
-            except Exception:
+            else:
                 # fallback: do nothing — avoid raising attribute errors
                 pass
 else:
