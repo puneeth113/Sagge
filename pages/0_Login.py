@@ -49,27 +49,44 @@ def hide_sidebar():
 
 # Safe rerun helper to avoid AttributeError on Streamlit versions without experimental_rerun
 def safe_rerun():
-    # Preferred API
+    # 1) Preferred API if present
     if hasattr(st, "experimental_rerun"):
         try:
             st.experimental_rerun()
             return
         except Exception:
             pass
-    # Fallback: try to toggle a query param to force a rerun if available
+
+    # 2) Fallback: toggle a simple query param (if query APIs exist)
     if hasattr(st, "experimental_get_query_params") and hasattr(st, "experimental_set_query_params"):
         try:
             params = st.experimental_get_query_params() or {}
             current = int(params.get("_rerun", ["0"])[0]) if params.get("_rerun") else 0
-            params["_rerun"] = str((current + 1) % 2)
+            params["_rerun"] = [str((current + 1) % 2)]
             st.experimental_set_query_params(**params)
             return
         except Exception:
             pass
-    # Final fallback: set a session flag and stop to allow the user to refresh
+
+    # 3) Final fallback: set a session flag and ask the user to refresh
     st.session_state["_needs_refresh"] = True
     st.info("Please refresh the page to complete the action.")
     st.stop()
+
+
+# Try to navigate to a multipage by setting query params, then rerun
+def navigate_to(page_name: str):
+    # Prefer query-param navigation when available
+    if hasattr(st, "experimental_set_query_params"):
+        try:
+            st.experimental_set_query_params(page=page_name)
+            # attempt rerun to apply navigation
+            safe_rerun()
+            return
+        except Exception:
+            pass
+    # If page_link exists we can't programmatically click it; fallback to rerun
+    safe_rerun()
 
 
 # Ensure users file exists with the requested admin account
@@ -100,7 +117,6 @@ users = _load_json(USERS_FILE, [])
 pending = _load_json(PENDING_FILE, [])
 
 # If the user is not logged in, hide the sidebar menu so the login page is the main focus.
-# This removes the side-bar page view while on the login screen.
 if not st.session_state.get("logged_in"):
     hide_sidebar()
 
@@ -112,7 +128,7 @@ with st.form(key="main_form"):
     login_username = st.text_input("User name", key="login_user")
     login_password = st.text_input("Password", type="password", key="login_pw")
 
-    # Request access fields (removed desired user name input per request)
+    # Request access fields (desired username removed per request)
     req_reason = st.text_area("Reason for access (brief)", key="req_reason")
 
     submitted = st.form_submit_button("Submit")
@@ -132,7 +148,8 @@ if submitted:
                 st.session_state["logged_in"] = True
                 st.session_state["user"] = login_username
                 st.session_state["role"] = found.get("role", "user")
-                safe_rerun()
+                # navigate to Home page after successful login
+                navigate_to("Home.py")
             else:
                 st.error("Invalid username or password, or account inactive.")
     else:  # Request access
@@ -151,14 +168,14 @@ if st.session_state.get("logged_in") and st.session_state.get("role") == "admin"
     if not pending:
         st.info("No pending requests.")
     else:
-        # We iterate over a copy of pending with index so we can mutate the real list safely
+        # Iterate over a copy so we can safely mutate the list
         for i, r in list(enumerate(pending)):
             display_name = r.get("username") or "(no desired username provided)"
             st.markdown(f"**{display_name}** — {r.get('reason')}")
             cols = st.columns([1, 1, 6])
             if cols[0].button("Approve", key=f"approve_{i}"):
                 # Add user with a temporary password (use placeholder username)
-                new_username = r.get("username") or f"user_{len(users)+1}"
+                new_username = r.get("username") or f"user_{len(users) + 1}"
                 new_user = {
                     "username": new_username,
                     "password_hash": _hash_password(new_username),
@@ -194,7 +211,6 @@ if st.session_state.get("logged_in"):
             if hasattr(st, "experimental_set_query_params"):
                 st.experimental_set_query_params(page="Home.py")
             else:
-                # fallback: do nothing — avoid raising attribute errors
                 pass
 else:
     st.info("Not logged in. Use the form above or request access.")
