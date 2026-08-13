@@ -1,0 +1,140 @@
+import os
+import json
+import hashlib
+import streamlit as st
+
+# Simple file-backed user store located under data/users.json
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+PENDING_FILE = os.path.join(DATA_DIR, "pending_requests.json")
+
+
+def _hash_password(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+
+def _load_json(path: str, default):
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _save_json(path: str, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+# Ensure users file exists with the requested admin account
+def ensure_initial_admin():
+    users = _load_json(USERS_FILE, [])
+    admin_username = "20250002367_OIS"
+    admin_pw = "superadmin1132002"
+    exists = any(u.get("username") == admin_username for u in users)
+    if not exists:
+        users.append({
+            "username": admin_username,
+            "password_hash": _hash_password(admin_pw),
+            "role": "admin",
+            "active": True,
+        })
+        _save_json(USERS_FILE, users)
+    return users
+
+
+ensure_initial_admin()
+
+
+st.set_page_config(page_title="Login", page_icon="🔐")
+st.title("🔐 Login")
+
+# --- load users & pending requests ---
+users = _load_json(USERS_FILE, [])
+pending = _load_json(PENDING_FILE, [])
+
+# --- handle login ---
+with st.form(key="login_form"):
+    username = st.text_input("User name")
+    password = st.text_input("Password", type="password")
+    submitted = st.form_submit_button("Login")
+
+if submitted:
+    found = None
+    for u in users:
+        if u.get("username") == username and u.get("active", True):
+            found = u
+            break
+    if found and found.get("password_hash") == _hash_password(password):
+        st.success(f"Welcome back, {username}!")
+        st.session_state["logged_in"] = True
+        st.session_state["user"] = username
+        st.session_state["role"] = found.get("role", "user")
+        st.experimental_rerun()
+    else:
+        st.error("Invalid username or password, or account inactive.")
+
+
+st.divider()
+
+# --- Request access flow ---
+st.header("Request access")
+with st.form(key="request_form"):
+    req_username = st.text_input("Desired user name", key="req_user")
+    req_reason = st.text_area("Reason for access (brief)")
+    req_sub = st.form_submit_button("Request Access")
+
+if req_sub:
+    if not req_username:
+        st.error("Please provide a desired user name to request access.")
+    else:
+        # Record a simple pending request
+        pending.append({"username": req_username, "reason": req_reason})
+        _save_json(PENDING_FILE, pending)
+        st.success("Your access request has been recorded and will be reviewed.")
+
+
+# --- Admin approval UI ---
+if st.session_state.get("logged_in") and st.session_state.get("role") == "admin":
+    st.divider()
+    st.header("Pending access requests")
+    if not pending:
+        st.info("No pending requests.")
+    else:
+        for i, r in enumerate(pending):
+            st.markdown(f"**{r.get('username')}** — {r.get('reason')}")
+            cols = st.columns([1, 1, 6])
+            if cols[0].button("Approve", key=f"approve_{i}"):
+                # Add user with a temporary password (same as username) — admin should inform them
+                new_user = {
+                    "username": r.get("username"),
+                    "password_hash": _hash_password(r.get("username", "changeme")),
+                    "role": "user",
+                    "active": True,
+                }
+                # avoid duplicates
+                if not any(u.get("username") == new_user["username"] for u in users):
+                    users.append(new_user)
+                    _save_json(USERS_FILE, users)
+                # remove request
+                pending.pop(i)
+                _save_json(PENDING_FILE, pending)
+                st.success(f"Approved access for {new_user['username']}. Temporary password set to the username — ask them to change it.")
+                st.experimental_rerun()
+            if cols[1].button("Reject", key=f"reject_{i}"):
+                pending.pop(i)
+                _save_json(PENDING_FILE, pending)
+                st.info(f"Rejected request from {r.get('username')}")
+                st.experimental_rerun()
+
+
+# If logged in, show quick link to Home
+if st.session_state.get("logged_in"):
+    st.divider()
+    st.success(f"Logged in as {st.session_state.get('user')}")
+    st.page_link("Home.py", label="Go to Home →", icon="🗂️")
+else:
+    st.info("Not logged in. Use the form above or request access.")
