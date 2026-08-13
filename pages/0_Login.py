@@ -47,6 +47,31 @@ def hide_sidebar():
     st.markdown(css, unsafe_allow_html=True)
 
 
+# Safe rerun helper to avoid AttributeError on Streamlit versions without experimental_rerun
+def safe_rerun():
+    # Preferred API
+    if hasattr(st, "experimental_rerun"):
+        try:
+            st.experimental_rerun()
+            return
+        except Exception:
+            pass
+    # Fallback: try to toggle a query param to force a rerun if available
+    if hasattr(st, "experimental_get_query_params") and hasattr(st, "experimental_set_query_params"):
+        try:
+            params = st.experimental_get_query_params() or {}
+            current = int(params.get("_rerun", ["0"])[0]) if params.get("_rerun") else 0
+            params["_rerun"] = str((current + 1) % 2)
+            st.experimental_set_query_params(**params)
+            return
+        except Exception:
+            pass
+    # Final fallback: set a session flag and stop to allow the user to refresh
+    st.session_state["_needs_refresh"] = True
+    st.info("Please refresh the page to complete the action.")
+    st.stop()
+
+
 # Ensure users file exists with the requested admin account
 def ensure_initial_admin():
     users = _load_json(USERS_FILE, [])
@@ -87,8 +112,7 @@ with st.form(key="main_form"):
     login_username = st.text_input("User name", key="login_user")
     login_password = st.text_input("Password", type="password", key="login_pw")
 
-    # Request access fields
-    req_username = st.text_input("Desired user name", key="req_user")
+    # Request access fields (removed desired user name input per request)
     req_reason = st.text_area("Reason for access (brief)", key="req_reason")
 
     submitted = st.form_submit_button("Submit")
@@ -108,17 +132,14 @@ if submitted:
                 st.session_state["logged_in"] = True
                 st.session_state["user"] = login_username
                 st.session_state["role"] = found.get("role", "user")
-                st.experimental_rerun()
+                safe_rerun()
             else:
                 st.error("Invalid username or password, or account inactive.")
     else:  # Request access
-        if not req_username:
-            st.error("Please provide a desired user name to request access.")
-        else:
-            # Record a simple pending request
-            pending.append({"username": req_username, "reason": req_reason})
-            _save_json(PENDING_FILE, pending)
-            st.success("Your access request has been recorded and will be reviewed.")
+        # Desired username removed; record only the reason and a timestamp
+        pending.append({"username": None, "reason": req_reason})
+        _save_json(PENDING_FILE, pending)
+        st.success("Your access request has been recorded and will be reviewed.")
 
 
 safe_divider()
@@ -132,13 +153,15 @@ if st.session_state.get("logged_in") and st.session_state.get("role") == "admin"
     else:
         # We iterate over a copy of pending with index so we can mutate the real list safely
         for i, r in list(enumerate(pending)):
-            st.markdown(f"**{r.get('username')}** — {r.get('reason')}")
+            display_name = r.get("username") or "(no desired username provided)"
+            st.markdown(f"**{display_name}** — {r.get('reason')}")
             cols = st.columns([1, 1, 6])
             if cols[0].button("Approve", key=f"approve_{i}"):
-                # Add user with a temporary password (same as username) — admin should inform them
+                # Add user with a temporary password (use placeholder username)
+                new_username = r.get("username") or f"user_{len(users)+1}"
                 new_user = {
-                    "username": r.get("username"),
-                    "password_hash": _hash_password(r.get("username", "changeme")),
+                    "username": new_username,
+                    "password_hash": _hash_password(new_username),
                     "role": "user",
                     "active": True,
                 }
@@ -150,12 +173,12 @@ if st.session_state.get("logged_in") and st.session_state.get("role") == "admin"
                 pending.pop(i)
                 _save_json(PENDING_FILE, pending)
                 st.success(f"Approved access for {new_user['username']}. Temporary password set to the username — ask them to change it.")
-                st.experimental_rerun()
+                safe_rerun()
             if cols[1].button("Reject", key=f"reject_{i}"):
                 pending.pop(i)
                 _save_json(PENDING_FILE, pending)
-                st.info(f"Rejected request from {r.get('username')}")
-                st.experimental_rerun()
+                st.info(f"Rejected request from {display_name}")
+                safe_rerun()
 
 
 # If logged in, show quick link to Home
