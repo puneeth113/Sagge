@@ -56,46 +56,49 @@ st.title("🔐 Login")
 users = _load_json(USERS_FILE, [])
 pending = _load_json(PENDING_FILE, [])
 
-# --- handle login ---
-with st.form(key="login_form"):
-    username = st.text_input("User name")
-    password = st.text_input("Password", type="password")
-    submitted = st.form_submit_button("Login")
+# Single form that can act as Login or Request Access to avoid ambiguity
+with st.form(key="main_form"):
+    action = st.radio("Action", ["Login", "Request access"], index=0, horizontal=True)
+
+    # Login fields
+    login_username = st.text_input("User name", key="login_user")
+    login_password = st.text_input("Password", type="password", key="login_pw")
+
+    # Request access fields
+    req_username = st.text_input("Desired user name", key="req_user")
+    req_reason = st.text_area("Reason for access (brief)", key="req_reason")
+
+    submitted = st.form_submit_button("Submit")
 
 if submitted:
-    found = None
-    for u in users:
-        if u.get("username") == username and u.get("active", True):
-            found = u
-            break
-    if found and found.get("password_hash") == _hash_password(password):
-        st.success(f"Welcome back, {username}!")
-        st.session_state["logged_in"] = True
-        st.session_state["user"] = username
-        st.session_state["role"] = found.get("role", "user")
-        st.experimental_rerun()
-    else:
-        st.error("Invalid username or password, or account inactive.")
+    if action == "Login":
+        if not login_username or not login_password:
+            st.error("Please enter both username and password to log in.")
+        else:
+            found = None
+            for u in users:
+                if u.get("username") == login_username and u.get("active", True):
+                    found = u
+                    break
+            if found and found.get("password_hash") == _hash_password(login_password):
+                st.success(f"Welcome back, {login_username}!")
+                st.session_state["logged_in"] = True
+                st.session_state["user"] = login_username
+                st.session_state["role"] = found.get("role", "user")
+                st.experimental_rerun()
+            else:
+                st.error("Invalid username or password, or account inactive.")
+    else:  # Request access
+        if not req_username:
+            st.error("Please provide a desired user name to request access.")
+        else:
+            # Record a simple pending request
+            pending.append({"username": req_username, "reason": req_reason})
+            _save_json(PENDING_FILE, pending)
+            st.success("Your access request has been recorded and will be reviewed.")
 
 
 st.divider()
-
-# --- Request access flow ---
-st.header("Request access")
-with st.form(key="request_form"):
-    req_username = st.text_input("Desired user name", key="req_user")
-    req_reason = st.text_area("Reason for access (brief)")
-    req_sub = st.form_submit_button("Request Access")
-
-if req_sub:
-    if not req_username:
-        st.error("Please provide a desired user name to request access.")
-    else:
-        # Record a simple pending request
-        pending.append({"username": req_username, "reason": req_reason})
-        _save_json(PENDING_FILE, pending)
-        st.success("Your access request has been recorded and will be reviewed.")
-
 
 # --- Admin approval UI ---
 if st.session_state.get("logged_in") and st.session_state.get("role") == "admin":
@@ -104,7 +107,8 @@ if st.session_state.get("logged_in") and st.session_state.get("role") == "admin"
     if not pending:
         st.info("No pending requests.")
     else:
-        for i, r in enumerate(pending):
+        # We iterate over a copy of pending with index so we can mutate the real list safely
+        for i, r in list(enumerate(pending)):
             st.markdown(f"**{r.get('username')}** — {r.get('reason')}")
             cols = st.columns([1, 1, 6])
             if cols[0].button("Approve", key=f"approve_{i}"):
@@ -135,6 +139,16 @@ if st.session_state.get("logged_in") and st.session_state.get("role") == "admin"
 if st.session_state.get("logged_in"):
     st.divider()
     st.success(f"Logged in as {st.session_state.get('user')}")
-    st.page_link("Home.py", label="Go to Home →", icon="🗂️")
+    # page_link may not exist in all Streamlit versions; guard to avoid AttributeError
+    if hasattr(st, "page_link"):
+        st.page_link("Home.py", label="Go to Home →", icon="🗂️")
+    else:
+        if st.button("Go to Home →"):
+            try:
+                # try to open the multipage page by setting query params (best-effort)
+                st.experimental_set_query_params(page="Home.py")
+            except Exception:
+                # fallback: do nothing — avoid raising attribute errors
+                pass
 else:
     st.info("Not logged in. Use the form above or request access.")
