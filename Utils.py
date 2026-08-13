@@ -31,6 +31,7 @@ def hide_default_sidebar_nav():
 # pointing at a file that doesn't exist will raise an error, and an active
 # page missing from this list simply won't get a nav link.
 PAGES = [
+    {"path": "pages/0_Login.py", "label": "Login", "icon": "🔐"},
     {"path": "Home.py", "label": "Home", "icon": "🗂️"},
     {"path": "pages/1_Long_Absence_Tracker.py", "label": "Long Absence Tracker", "icon": "📅"},
     {"path": "pages/3_Payroll_Calculator.py", "label": "Payroll Calculator", "icon": "🧾"},
@@ -41,15 +42,34 @@ PAGES = [
 
 def render_top_nav(active_label: str):
     """Renders a simple horizontal row of page links at the top of a page,
-    used instead of the default sidebar navigation list."""
+    used instead of the default sidebar navigation list.
+
+    This now also shows a small user status area on the right with a logout
+    button when the user is logged in."""
     hide_default_sidebar_nav()
-    cols = st.columns(len(PAGES))
-    for col, page in zip(cols, PAGES):
+    # extra column at the end reserved for user status / logout
+    cols = st.columns(len(PAGES) + 1)
+    for col, page in zip(cols[:-1], PAGES):
         with col:
             if page["label"] == active_label:
                 st.markdown(f"**{page['icon']} {page['label']}**")
             else:
                 st.page_link(page["path"], label=page["label"], icon=page["icon"])
+
+    # right-most column: user status and logout
+    with cols[-1]:
+        if st.session_state.get("logged_in"):
+            user = st.session_state.get("user")
+            st.markdown(f"**👤 {user}**")
+            if st.button("Logout"):
+                # clear login-related session state keys (preserve app data)
+                for k in ["logged_in", "user", "role"]:
+                    if k in st.session_state:
+                        del st.session_state[k]
+                st.experimental_rerun()
+        else:
+            st.markdown("Not logged in")
+
     st.divider()
 
 
