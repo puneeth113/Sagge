@@ -1,6 +1,8 @@
 import os
 import json
 import hashlib
+import secrets
+from datetime import datetime
 import streamlit as st
 
 # Simple file-backed user store located under data/users.json
@@ -128,33 +130,43 @@ with st.form(key="main_form"):
     login_username = st.text_input("User name", key="login_user")
     login_password = st.text_input("Password", type="password", key="login_pw")
 
-    # Request access fields (desired username removed per request)
+    # Request access fields (desired username intentionally omitted)
     req_reason = st.text_area("Reason for access (brief)", key="req_reason")
 
     submitted = st.form_submit_button("Submit")
 
 if submitted:
     if action == "Login":
+        login_username = (login_username or "").strip()
+        login_password = (login_password or "")
         if not login_username or not login_password:
             st.error("Please enter both username and password to log in.")
         else:
             found = None
             for u in users:
-                if u.get("username") == login_username and u.get("active", True):
+                # case-insensitive username match to avoid trivial mismatches
+                u_name = (u.get("username") or "").strip()
+                if u_name.lower() == login_username.lower():
                     found = u
                     break
-            if found and found.get("password_hash") == _hash_password(login_password):
-                st.success(f"Welcome back, {login_username}!")
+
+            if not found:
+                st.error("Invalid username or password.")
+            elif not found.get("active", True):
+                st.error("Account is inactive. Contact an administrator.")
+            elif found.get("password_hash") != _hash_password(login_password):
+                st.error("Invalid username or password.")
+            else:
+                st.success(f"Welcome back, {found.get('username')}!")
                 st.session_state["logged_in"] = True
-                st.session_state["user"] = login_username
+                st.session_state["user"] = found.get("username")
                 st.session_state["role"] = found.get("role", "user")
                 # navigate to Home page after successful login
                 navigate_to("Home.py")
-            else:
-                st.error("Invalid username or password, or account inactive.")
     else:  # Request access
-        # Desired username removed; record only the reason and a timestamp
-        pending.append({"username": None, "reason": req_reason})
+        # Do not collect a desired username by design; record reason and timestamp
+        req = {"username": None, "reason": (req_reason or "").strip(), "created_at": datetime.utcnow().isoformat()}
+        pending.append(req)
         _save_json(PENDING_FILE, pending)
         st.success("Your access request has been recorded and will be reviewed.")
 
@@ -175,25 +187,38 @@ if st.session_state.get("logged_in") and st.session_state.get("role") == "admin"
         # Iterate over a copy so we can safely mutate the list
         for i, r in list(enumerate(pending)):
             display_name = r.get("username") or "(no desired username provided)"
-            st.markdown(f"**{display_name}** — {r.get('reason')}")
+            reason = r.get("reason") or "(no reason provided)"
+            created = r.get("created_at") or "(unknown time)"
+            st.markdown(f"**{display_name}** — {reason} — submitted: {created}")
             cols = st.columns([1, 1, 6])
             if cols[0].button("Approve", key=f"approve_{i}"):
                 # Add user with a temporary password (use placeholder username)
+                # Generate a deterministic-but-unique username if none provided
                 new_username = r.get("username") or f"user_{len(users) + 1}"
+                # ensure username is unique
+                existing_names = {u.get("username") for u in users}
+                suffix = 1
+                base_username = new_username
+                while new_username in existing_names:
+                    new_username = f"{base_username}_{suffix}"
+                    suffix += 1
+
+                temp_password = secrets.token_urlsafe(8)
                 new_user = {
                     "username": new_username,
-                    "password_hash": _hash_password(new_username),
+                    "password_hash": _hash_password(temp_password),
                     "role": "user",
                     "active": True,
                 }
-                # avoid duplicates
-                if not any(u.get("username") == new_user["username"] for u in users):
-                    users.append(new_user)
-                    _save_json(USERS_FILE, users)
+                users.append(new_user)
+                _save_json(USERS_FILE, users)
+
                 # remove request
                 pending.pop(i)
                 _save_json(PENDING_FILE, pending)
-                st.success(f"Approved access for {new_user['username']}. Temporary password set to the username — ask them to change it.")
+
+                st.success(f"Approved access for {new_user['username']}.")
+                st.info(f"Temporary password: {temp_password} (share this with the user and advise they change it on first login)")
                 safe_rerun()
             if cols[1].button("Reject", key=f"reject_{i}"):
                 pending.pop(i)
