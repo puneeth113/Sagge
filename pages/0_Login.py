@@ -159,6 +159,10 @@ if submitted:
         st.success("Your access request has been recorded and will be reviewed.")
 
 
+# Refresh pending/users from disk so admin sessions see new requests made in other sessions
+pending = _load_json(PENDING_FILE, [])
+users = _load_json(USERS_FILE, [])
+
 safe_divider()
 
 # --- Admin approval UI ---
