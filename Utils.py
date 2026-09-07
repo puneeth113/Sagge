@@ -34,6 +34,7 @@ PAGES = [
     {"path": "pages/0_Login.py", "label": "Login", "icon": "🔐"},
     {"path": "Home.py", "label": "Home", "icon": "🗂️"},
     {"path": "pages/1_Long_Absence_Tracker.py", "label": "Long Absence Tracker", "icon": "📅"},
+    {"path": "pages/2_Retention_Fund_Tracker.py", "label": "Retention Fund Tracker", "icon": "💰"},
     {"path": "pages/3_Payroll_Calculator.py", "label": "Payroll Calculator", "icon": "🧾"},
     {"path": "pages/4_Employee_Database.py", "label": "Employee Database", "icon": "👥"},
     {"path": "pages/7_Shift_management.py", "label": "Shift Management", "icon": "🕒"},
@@ -167,6 +168,8 @@ SENSITIVE_SESSION_KEYS = [
     "payroll_result",
     "gig_data",
     "gig_result",
+    "retention_fund_data",
+    "retention_result",
 ]
 
 
@@ -273,6 +276,172 @@ DEFAULT_ABSENCE_THRESHOLDS = [
     ("To Be Checked (5-20 days)", 5, 20),
     ("Probable Exit Case (>20 days)", 21, None),
 ]
+
+
+# --------------------------------------------------------------------------
+# 2. Retention Fund Tracking
+# --------------------------------------------------------------------------
+
+def sample_employee_master_for_retention() -> pd.DataFrame:
+    """Sample employee master sheet for retention fund tracking.
+    
+    Columns: ERP, Name, Joining Date, Company Code (CC), Branch, 
+    CTC / Earned Salary
+    """
+    return pd.DataFrame([
+        {
+            "ERP": "E001",
+            "Name": "Ravi Kumar",
+            "Joining Date": "2020-01-15",
+            "Company Code": "IGNITE",
+            "Branch": "Koramangala",
+            "Earned Salary": 25000.00,
+        },
+        {
+            "ERP": "E002",
+            "Name": "Sita Sharma",
+            "Joining Date": "2021-06-10",
+            "Company Code": "MAIN",
+            "Branch": "Koramangala",
+            "Earned Salary": 35000.00,
+        },
+        {
+            "ERP": "E003",
+            "Name": "Mohan Das",
+            "Joining Date": "2019-03-20",
+            "Company Code": "MAIN",
+            "Branch": "Whitefield",
+            "Earned Salary": 40000.00,
+        },
+    ])
+
+
+def compute_retention_fund_deduction(
+    df: pd.DataFrame,
+    erp_col: str,
+    name_col: str,
+    cc_col: str,
+    branch_col: str,
+    salary_col: str,
+    deduction_pct: float = 10.0,
+    ignite_excluded: bool = True,
+) -> pd.DataFrame:
+    """Compute 10% retention fund deduction on earned gross salary.
+    
+    Args:
+        df: Employee master DataFrame
+        erp_col: Column name for ERP ID
+        name_col: Column name for employee name
+        cc_col: Column name for company code (CC)
+        branch_col: Column name for branch
+        salary_col: Column name for earned salary
+        deduction_pct: Deduction percentage (default 10%)
+        ignite_excluded: If True, exclude IGNITE company code from deduction
+    
+    Returns:
+        DataFrame with retention fund calculations
+    """
+    out = df.copy()
+    
+    # Coerce salary column to numeric
+    out[salary_col] = coerce_numeric_column(out[salary_col], salary_col)
+    
+    # Determine if deduction applies (exclude IGNITE by default)
+    if ignite_excluded:
+        out["Deduction Applicable"] = out[cc_col].astype(str).str.upper() != "IGNITE"
+    else:
+        out["Deduction Applicable"] = True
+    
+    # Calculate deduction amount (only where applicable)
+    out["Deduction Amount"] = 0.0
+    out.loc[out["Deduction Applicable"], "Deduction Amount"] = (
+        out.loc[out["Deduction Applicable"], salary_col] * deduction_pct / 100
+    )
+    
+    # Calculate accumulated amount (can be summed over multiple months)
+    out["Amount After Deduction"] = out[salary_col] - out["Deduction Amount"]
+    
+    return out
+
+
+def categorize_retention_status(df: pd.DataFrame) -> pd.DataFrame:
+    """Categorize retention fund status for each employee.
+    
+    Returns DataFrame with additional 'Status' column indicating:
+    - No Deduction: Deduction not applicable
+    - Pending Release: Has accumulated deduction pending release
+    """
+    out = df.copy()
+    
+    def get_status(row):
+        if not row.get("Deduction Applicable", False):
+            return "No Deduction"
+        deduction = row.get("Deduction Amount", 0)
+        if deduction > 0:
+            return "Pending Release"
+        return "Not Applicable"
+    
+    out["Status"] = out.apply(get_status, axis=1)
+    return out
+
+
+def filter_by_company_code(df: pd.DataFrame, cc_col: str, company_codes: list) -> pd.DataFrame:
+    """Filter employee data by company codes.
+    
+    Args:
+        df: Employee DataFrame
+        cc_col: Column name for company code
+        company_codes: List of company codes to include
+    
+    Returns:
+        Filtered DataFrame
+    """
+    if not company_codes:
+        return df
+    return df[df[cc_col].astype(str).str.upper().isin([cc.upper() for cc in company_codes])]
+
+
+def filter_by_branch(df: pd.DataFrame, branch_col: str, branches: list) -> pd.DataFrame:
+    """Filter employee data by branches.
+    
+    Args:
+        df: Employee DataFrame
+        branch_col: Column name for branch
+        branches: List of branches to include
+    
+    Returns:
+        Filtered DataFrame
+    """
+    if not branches:
+        return df
+    return df[df[branch_col].astype(str).str.upper().isin([b.upper() for b in branches])]
+
+
+def generate_retention_report(
+    df: pd.DataFrame,
+    erp_col: str,
+    name_col: str,
+    cc_col: str,
+    branch_col: str,
+    deduction_col: str,
+    status_col: str,
+) -> dict:
+    """Generate summary statistics for retention fund report.
+    
+    Returns:
+        Dictionary with summary metrics
+    """
+    deductions = df[df[status_col] == "Pending Release"][deduction_col].sum()
+    
+    return {
+        "Total Employees": len(df),
+        "Employees with Deduction": (df[status_col] == "Pending Release").sum(),
+        "Employees without Deduction": (df[status_col] == "No Deduction").sum(),
+        "Total Accumulated Deduction": deductions,
+        "Average Deduction per Employee": deductions / max((df[status_col] == "Pending Release").sum(), 1),
+        "By Company Code": df.groupby(cc_col)[deduction_col].sum().to_dict(),
+        "By Branch": df.groupby(branch_col)[deduction_col].sum().to_dict(),
+    }
 
 
 # --------------------------------------------------------------------------
