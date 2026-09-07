@@ -170,6 +170,7 @@ SENSITIVE_SESSION_KEYS = [
     "gig_result",
     "retention_fund_data",
     "retention_result",
+    "internal_transfers",
 ]
 
 
@@ -316,6 +317,43 @@ def sample_employee_master_for_retention() -> pd.DataFrame:
     ])
 
 
+def sample_internal_transfer_template() -> pd.DataFrame:
+    """Sample internal transfer data for retention fund tracking.
+    
+    Columns: ERP, Name, Old Branch, Old Branch CC, New Branch, New Branch CC, 
+    Gross Change Amount
+    """
+    return pd.DataFrame([
+        {
+            "ERP": "E001",
+            "Name": "Ravi Kumar",
+            "Old Branch": "Koramangala",
+            "Old Branch CC": "MAIN",
+            "New Branch": "Whitefield",
+            "New Branch CC": "MAIN",
+            "Gross Change Amount": 0.00,
+        },
+        {
+            "ERP": "E002",
+            "Name": "Sita Sharma",
+            "Old Branch": "Koramangala",
+            "Old Branch CC": "MAIN",
+            "New Branch": "Bangalore",
+            "New Branch CC": "IGNITE",
+            "Gross Change Amount": 5000.00,
+        },
+        {
+            "ERP": "E003",
+            "Name": "Mohan Das",
+            "Old Branch": "Whitefield",
+            "Old Branch CC": "MAIN",
+            "New Branch": "Koramangala",
+            "New Branch CC": "MAIN",
+            "Gross Change Amount": -2000.00,
+        },
+    ])
+
+
 def compute_retention_fund_deduction(
     df: pd.DataFrame,
     erp_col: str,
@@ -417,6 +455,54 @@ def filter_by_branch(df: pd.DataFrame, branch_col: str, branches: list) -> pd.Da
     return df[df[branch_col].astype(str).str.upper().isin([b.upper() for b in branches])]
 
 
+def merge_internal_transfers(
+    retention_df: pd.DataFrame,
+    transfers_df: pd.DataFrame,
+    erp_col: str,
+    old_cc_col: str,
+    new_cc_col: str,
+) -> pd.DataFrame:
+    """Merge retention fund data with internal transfer data.
+    
+    Updates company code for transferred employees and tracks old CC info.
+    
+    Args:
+        retention_df: Retention fund DataFrame
+        transfers_df: Internal transfer DataFrame
+        erp_col: Column name for ERP ID
+        old_cc_col: Column name for old company code in transfers
+        new_cc_col: Column name for new company code in transfers
+    
+    Returns:
+        Updated retention DataFrame with transfer information
+    """
+    out = retention_df.copy()
+    
+    # Add columns to track transfers
+    out["Transferred"] = False
+    out["Previous CC"] = out.get("Company Code", "")
+    
+    # Merge transfer information
+    transfer_map = {}
+    for _, row in transfers_df.iterrows():
+        erp = row.get(erp_col)
+        transfer_map[erp] = {
+            "old_cc": row.get(old_cc_col),
+            "new_cc": row.get(new_cc_col),
+        }
+    
+    # Update company codes for transferred employees
+    for idx, row in out.iterrows():
+        erp = row.get(erp_col)
+        if erp in transfer_map:
+            transfer_info = transfer_map[erp]
+            out.at[idx, "Previous CC"] = transfer_info["old_cc"]
+            out.at[idx, "Company Code"] = transfer_info["new_cc"]
+            out.at[idx, "Transferred"] = True
+    
+    return out
+
+
 def generate_retention_report(
     df: pd.DataFrame,
     erp_col: str,
@@ -444,8 +530,35 @@ def generate_retention_report(
     }
 
 
+def process_internal_transfers(
+    transfers_df: pd.DataFrame,
+    erp_col: str,
+    gross_change_col: str,
+) -> pd.DataFrame:
+    """Process internal transfer data and validate format.
+    
+    Args:
+        transfers_df: Internal transfer DataFrame
+        erp_col: Column name for ERP ID
+        gross_change_col: Column name for gross change amount
+    
+    Returns:
+        Processed transfer DataFrame with numeric columns coerced
+    """
+    out = transfers_df.copy()
+    
+    # Coerce gross change to numeric
+    if gross_change_col in out.columns:
+        out[gross_change_col] = pd.to_numeric(
+            out[gross_change_col].astype(str).str.replace(r"[₹$,\s]", "", regex=True),
+            errors="coerce"
+        ).fillna(0)
+    
+    return out
+
+
 # --------------------------------------------------------------------------
-# 2. Payroll: Full-time employees (PF + ESIC) & Gig workers (TDS)
+# 3. Payroll: Full-time employees (PF + ESIC) & Gig workers (TDS)
 # --------------------------------------------------------------------------
 
 def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.Series:
@@ -607,7 +720,7 @@ def compute_gig_worker_billing(
 
 
 # --------------------------------------------------------------------------
-# 3. Gross <-> In-Hand converters
+# 4. Gross <-> In-Hand converters
 # --------------------------------------------------------------------------
 
 def solve_gross_for_net_fulltime(
