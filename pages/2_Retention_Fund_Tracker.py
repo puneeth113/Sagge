@@ -3,7 +3,7 @@ import importlib.util
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 def _load_utils():
@@ -83,6 +83,55 @@ def auto_detect_column(df: pd.DataFrame, keywords: list) -> str:
     return df.columns[0] if len(df.columns) > 0 else None
 
 
+def calculate_expected_release_date(joining_date, min_tenure_months=12):
+    """Calculate expected release date based on joining date and minimum tenure.
+    
+    Args:
+        joining_date: Employee joining date
+        min_tenure_months: Minimum tenure in months before release
+    
+    Returns:
+        Expected release date
+    """
+    try:
+        if pd.isna(joining_date):
+            return None
+        
+        # Convert to datetime if string
+        if isinstance(joining_date, str):
+            joining_dt = pd.to_datetime(joining_date)
+        else:
+            joining_dt = joining_date
+        
+        # Add minimum tenure months
+        release_date = joining_dt + pd.DateOffset(months=min_tenure_months)
+        return release_date
+    except:
+        return None
+
+
+def count_deductions_by_status(df: pd.DataFrame) -> dict:
+    """Count completed and pending deductions.
+    
+    Args:
+        df: Result DataFrame with deduction data
+    
+    Returns:
+        Dictionary with deduction counts
+    """
+    if "Status" not in df.columns:
+        return {"Completed": 0, "Pending": 0}
+    
+    pending = (df["Status"] == "Pending Release").sum()
+    completed = (df["Status"] == "No Deduction").sum()
+    
+    return {
+        "Pending": pending,
+        "Completed": completed,
+        "Total": len(df)
+    }
+
+
 # ------------------------------------------------------------------ #
 # Upload Employee Master Data
 # ------------------------------------------------------------------ #
@@ -90,7 +139,7 @@ st.markdown("#### Upload Employee Master Data")
 st.caption(
     "Columns required: **ERP, Name, Joining Date, Company Code, Branch, Earned Salary**. "
     "Do not deduct from employees with Company Code = IGNITE. "
-    "**Joining Date is mandatory** to calculate deduction eligibility."
+    "**Joining Date is mandatory** to calculate deduction eligibility and expected release date."
 )
 
 sample = sample_employee_master_for_retention()
@@ -176,36 +225,23 @@ if "retention_fund_data" in st.session_state and not st.session_state["retention
         min_tenure = st.number_input(
             "Minimum Tenure (months) to Apply Deduction",
             min_value=0,
-            value=0,
+            value=12,
             key="min_tenure",
             help="Employees with tenure less than this will not have deductions applied.",
         )
 
-    st.markdown("#### Filter by Company Code & Branch (Optional)")
+    st.markdown("#### Filter by Branch (Optional)")
 
-    filter_col1, filter_col2 = st.columns(2)
-    with filter_col1:
-        all_cc = sorted(df[cc_col].astype(str).unique().tolist())
-        selected_cc = st.multiselect(
-            "Select Company Codes (leave empty for all)",
-            options=all_cc,
-            key="filter_cc",
-        )
-    with filter_col2:
-        all_branches = sorted(df[branch_col].astype(str).unique().tolist())
-        selected_branches = st.multiselect(
-            "Select Branches (leave empty for all)",
-            options=all_branches,
-            key="filter_branches",
-        )
+    all_branches = sorted(df[branch_col].astype(str).unique().tolist())
+    selected_branches = st.multiselect(
+        "Select Branches (leave empty for all)",
+        options=all_branches,
+        key="filter_branches",
+    )
 
     if st.button("Calculate Retention Fund Deduction", key="calc_retention"):
         try:
             work_df = df.copy()
-
-            # Apply company code filter
-            if selected_cc:
-                work_df = filter_by_company_code(work_df, cc_col, selected_cc)
 
             # Apply branch filter
             if selected_branches:
@@ -225,6 +261,18 @@ if "retention_fund_data" in st.session_state and not st.session_state["retention
 
             # Categorize retention status
             result = categorize_retention_status(result)
+            
+            # Calculate expected release date
+            result["Expected Release Date"] = result[joining_col].apply(
+                lambda x: calculate_expected_release_date(x, min_tenure)
+            )
+            
+            # Format expected release date for display
+            result["Expected Release Date Formatted"] = result["Expected Release Date"].dt.strftime('%Y-%m-%d')
+            
+            # Store deduction counts
+            deduction_counts = count_deductions_by_status(result)
+            st.session_state["deduction_counts"] = deduction_counts
 
             st.session_state["retention_result"] = result
             st.success("✅ Retention fund calculation completed!")
@@ -234,6 +282,7 @@ if "retention_fund_data" in st.session_state and not st.session_state["retention
 
     if "retention_result" in st.session_state:
         result = st.session_state["retention_result"]
+        deduction_counts = st.session_state.get("deduction_counts", {})
 
         st.markdown("#### Retention Fund Deduction Details")
         st.dataframe(result, use_container_width=True, height=400)
@@ -245,15 +294,17 @@ if "retention_fund_data" in st.session_state and not st.session_state["retention
         deduction_employees = (result["Deduction Applicable"] == True).sum()
         no_deduction_employees = (result["Deduction Applicable"] == False).sum()
         total_deduction = result["Deduction Amount"].sum()
-        avg_deduction = result[result["Deduction Amount"] > 0]["Deduction Amount"].mean()
-
-        sum_col1, sum_col2, sum_col3, sum_col4 = st.columns(4)
+        pending_count = deduction_counts.get("Pending", 0)
+        
+        sum_col1, sum_col2, sum_col3, sum_col4, sum_col5 = st.columns(5)
         sum_col1.metric("Total Employees", total_employees)
         sum_col2.metric("Employees with Deduction", deduction_employees)
         sum_col3.metric("Employees without Deduction", no_deduction_employees)
-        sum_col4.metric("Total Accumulated Deduction", f"₹{total_deduction:,.0f}")
+        sum_col4.metric("Pending Deductions", pending_count)
+        sum_col5.metric("Total Accumulated Deduction", f"₹{total_deduction:,.0f}")
 
         if deduction_employees > 0:
+            avg_deduction = result[result["Deduction Amount"] > 0]["Deduction Amount"].mean()
             st.metric("Average Deduction per Employee", f"₹{avg_deduction:,.0f}")
 
         # Breakdown by Company Code
@@ -262,11 +313,12 @@ if "retention_fund_data" in st.session_state and not st.session_state["retention
             result.groupby(cc_col)
             .agg({
                 "Deduction Amount": "sum",
+                "Status": lambda x: (x == "Pending Release").sum(),
                 erp_col: "count",
             })
-            .rename(columns={erp_col: "Count"})
+            .rename(columns={"Status": "Pending Count"})
         )
-        cc_summary.columns = ["Total Deduction", "Employee Count"]
+        cc_summary.columns = ["Total Deduction", "Pending Count", "Employee Count"]
         st.dataframe(cc_summary, use_container_width=True)
 
         # Breakdown by Branch
@@ -275,11 +327,12 @@ if "retention_fund_data" in st.session_state and not st.session_state["retention
             result.groupby(branch_col)
             .agg({
                 "Deduction Amount": "sum",
+                "Status": lambda x: (x == "Pending Release").sum(),
                 erp_col: "count",
             })
-            .rename(columns={erp_col: "Count"})
+            .rename(columns={"Status": "Pending Count"})
         )
-        branch_summary.columns = ["Total Deduction", "Employee Count"]
+        branch_summary.columns = ["Total Deduction", "Pending Count", "Employee Count"]
         st.dataframe(branch_summary, use_container_width=True)
 
         # Deduction Status Summary
@@ -290,8 +343,10 @@ if "retention_fund_data" in st.session_state and not st.session_state["retention
         # List of employees with pending releases
         st.markdown("#### Employees with Pending Release")
         pending = result[result["Status"] == "Pending Release"][
-            [erp_col, name_col, cc_col, branch_col, salary_col, "Deduction Amount"]
+            [erp_col, name_col, cc_col, branch_col, salary_col, "Deduction Amount", "Expected Release Date Formatted"]
         ].copy()
+        pending.columns = [erp_col, name_col, cc_col, branch_col, salary_col, "Deduction Amount", "Expected Release Date"]
+        
         if not pending.empty:
             st.dataframe(pending, use_container_width=True)
         else:
