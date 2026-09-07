@@ -63,11 +63,11 @@ if not st.session_state.get("logged_in"):
 st.title("🗂️ HR Assistant")
 st.caption(
     "Branch HR operations toolkit — employee database, long-absence tracking, "
-    "shift management, and payroll (PF/ESIC/TDS) calculations."
+    "shift management, retention fund management, and payroll (PF/ESIC/TDS) calculations."
 )
 
 st.markdown("#### Navigate")
-nav1, nav2, nav3, nav4 = st.columns(4)
+nav1, nav2, nav3, nav4, nav5 = st.columns(5)
 
 with nav1:
     with st.container(border=True):
@@ -77,17 +77,25 @@ with nav1:
 
 with nav2:
     with st.container(border=True):
+        st.markdown("##### 💰 Retention Fund Tracker")
+        st.caption("Manage employee retention fund deductions by company code and branch.")
+        col_a, col_b = st.columns(2)
+        col_a.page_link("pages/2_Retention_Fund_Tracker.py", label="Compute →", icon="📊")
+        col_b.page_link("pages/2a_Retention_Dashboard.py", label="Dashboard →", icon="📈")
+
+with nav3:
+    with st.container(border=True):
         st.markdown("##### 🧾 Payroll Calculator")
         st.caption("Compute monthly gross, PF/ESIC deductions and net pay for full-time staff, plus TDS billing for gig workers.")
         st.page_link("pages/3_Payroll_Calculator.py", label="Open →", icon="🧾")
 
-with nav3:
+with nav4:
     with st.container(border=True):
         st.markdown("##### 👥 Employee Database")
         st.caption("Upload your employee master sheet, filter and search records, and download filtered views.")
         st.page_link("pages/4_Employee_Database.py", label="Open →", icon="👥")
 
-with nav4:
+with nav5:
     with st.container(border=True):
         st.markdown("##### 🕒 Shift Management")
         st.caption("Configure category & branch start time masters, then bulk-validate employee shift assignments.")
@@ -176,4 +184,3 @@ if st.session_state.get("role") == "admin":
                     _save_json(users_file, users)
                     st.success(f"User {u.get('username')} activated.")
                     st.experimental_rerun()
-
