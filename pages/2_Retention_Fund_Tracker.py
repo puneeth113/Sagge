@@ -50,7 +50,7 @@ render_top_nav("Retention Fund Tracker")
 st.title("💰 Retention Fund Tracker")
 st.caption(
     "Track employee retention fund deductions by company code and branch. "
-    "Compute 10% deduction on earned gross salary, manage pending releases, and generate reports."
+    "Compute 10% deduction on earned gross salary based on DOJ, manage pending releases, and generate reports."
 )
 
 with st.expander("🔒 Data handling on this page", expanded=False):
@@ -73,13 +73,24 @@ def _show_error(e: Exception, context: str):
         st.error(safe_error_message(e, context=context))
 
 
+def auto_detect_column(df: pd.DataFrame, keywords: list) -> str:
+    """Auto-detect column by matching keywords (case-insensitive)."""
+    for col in df.columns:
+        col_lower = col.lower()
+        for keyword in keywords:
+            if keyword.lower() in col_lower:
+                return col
+    return df.columns[0] if len(df.columns) > 0 else None
+
+
 # ------------------------------------------------------------------ #
 # Upload Employee Master Data
 # ------------------------------------------------------------------ #
 st.markdown("#### Upload Employee Master Data")
 st.caption(
     "Columns required: **ERP, Name, Joining Date, Company Code, Branch, Earned Salary**. "
-    "Do not deduct from employees with Company Code = IGNITE."
+    "Do not deduct from employees with Company Code = IGNITE. "
+    "**Joining Date is mandatory** to calculate deduction eligibility."
 )
 
 sample = sample_employee_master_for_retention()
@@ -105,20 +116,42 @@ if uploaded:
 if "retention_fund_data" in st.session_state and not st.session_state["retention_fund_data"].empty:
     df = st.session_state["retention_fund_data"]
 
-    st.markdown("#### Map Columns")
+    # Auto-detect columns
+    erp_col = auto_detect_column(df, ["erp", "emp id", "employee id"])
+    name_col = auto_detect_column(df, ["name", "employee name"])
+    cc_col = auto_detect_column(df, ["cc", "company code", "company"])
+    branch_col = auto_detect_column(df, ["branch"])
+    salary_col = auto_detect_column(df, ["salary", "earned", "gross"])
+    joining_col = auto_detect_column(df, ["joining", "doj", "date of joining"])
+    
+    # Verify all columns were detected
+    missing_cols = []
+    if not erp_col:
+        missing_cols.append("ERP ID")
+    if not name_col:
+        missing_cols.append("Name")
+    if not cc_col:
+        missing_cols.append("Company Code")
+    if not branch_col:
+        missing_cols.append("Branch")
+    if not salary_col:
+        missing_cols.append("Earned Salary")
+    if not joining_col:
+        missing_cols.append("Joining Date (Mandatory)")
+    
+    if missing_cols:
+        st.error(f"❌ Missing required columns: {', '.join(missing_cols)}")
+        st.stop()
+    
+    # Display auto-detected columns
+    st.markdown("#### Auto-Detected Columns")
     col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1:
-        erp_col = st.selectbox("ERP ID Column", options=df.columns, key="erp_col")
-    with col2:
-        name_col = st.selectbox("Name Column", options=df.columns, key="name_col")
-    with col3:
-        cc_col = st.selectbox("Company Code Column", options=df.columns, key="cc_col")
-    with col4:
-        branch_col = st.selectbox("Branch Column", options=df.columns, key="branch_col")
-    with col5:
-        salary_col = st.selectbox("Earned Salary Column", options=df.columns, key="salary_col")
-    with col6:
-        joining_date_col = st.selectbox("Joining Date Column (optional)", options=["-"] + list(df.columns), key="joining_col")
+    col1.info(f"📌 ERP ID:\n`{erp_col}`")
+    col2.info(f"📌 Name:\n`{name_col}`")
+    col3.info(f"📌 CC:\n`{cc_col}`")
+    col4.info(f"📌 Branch:\n`{branch_col}`")
+    col5.info(f"📌 Salary:\n`{salary_col}`")
+    col6.warning(f"📌 DOJ:\n`{joining_col}`\n(Mandatory)")
 
     st.markdown("#### Configure Retention Settings")
 
@@ -139,7 +172,14 @@ if "retention_fund_data" in st.session_state and not st.session_state["retention
             help="If checked, employees with Company Code = IGNITE will not have deductions applied.",
         )
     with ret_col3:
-        st.markdown("")  # Spacer
+        # Minimum tenure in months to apply deduction
+        min_tenure = st.number_input(
+            "Minimum Tenure (months) to Apply Deduction",
+            min_value=0,
+            value=0,
+            key="min_tenure",
+            help="Employees with tenure less than this will not have deductions applied.",
+        )
 
     st.markdown("#### Filter by Company Code & Branch (Optional)")
 
