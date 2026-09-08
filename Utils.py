@@ -34,7 +34,7 @@ PAGES = [
     {"path": "pages/0_Login.py", "label": "Login", "icon": "🔐"},
     {"path": "Home.py", "label": "Home", "icon": "🗂️"},
     {"path": "pages/1_Long_Absence_Tracker.py", "label": "Long Absence Tracker", "icon": "📅"},
-    {"path": "pages/2_Retention_Fund_Tracker.py", "label": "Retention Fund Tracker", "icon": "💰"},
+    {"path": "pages/2_Retention_Fund.py", "label": "Retention Fund", "icon": "💰"},
     {"path": "pages/3_Payroll_Calculator.py", "label": "Payroll Calculator", "icon": "🧾"},
     {"path": "pages/4_Employee_Database.py", "label": "Employee Database", "icon": "👥"},
     {"path": "pages/7_Shift_management.py", "label": "Shift Management", "icon": "🕒"},
