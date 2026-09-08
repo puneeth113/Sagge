@@ -48,6 +48,10 @@ categorize_retention_status = _u.categorize_retention_status
 filter_by_company_code = _u.filter_by_company_code
 filter_by_branch = _u.filter_by_branch
 generate_retention_report = _u.generate_retention_report
+load_ignored_company_codes = _u.load_ignored_company_codes
+save_ignored_company_codes = _u.save_ignored_company_codes
+sample_erp_transfer_template = _u.sample_erp_transfer_template
+apply_internal_transfers = _u.apply_internal_transfers
 
 st.set_page_config(page_title="Retention Fund", page_icon="💰", layout="wide")
 render_top_nav("Retention Fund")
@@ -147,10 +151,45 @@ tab_tracker, tab_dashboard = st.tabs(["💰 Retention Fund Tracker", "📊 Reten
 # TAB 1: RETENTION FUND TRACKER (computation)
 # ================================================================
 with tab_tracker:
+    # ------------------------------------------------------------
+    # Ignored Company Codes (CRUD) — excluded from deduction entirely
+    # ------------------------------------------------------------
+    st.markdown("#### Ignored Company Codes (excluded from deduction)")
+    with st.expander("Manage ignored company codes", expanded=False):
+        st.caption(
+            "Employees whose Company Code matches any entry below will never have a retention "
+            "fund deduction applied. 'IGNITE' is the default, but you can add or remove any code."
+        )
+
+        ignored_codes = load_ignored_company_codes()
+
+        if ignored_codes:
+            for i, code in enumerate(ignored_codes):
+                c1, c2 = st.columns([5, 1])
+                c1.write(f"• `{code}`")
+                if c2.button("Remove", key=f"remove_ignore_cc_{i}"):
+                    save_ignored_company_codes([c for c in ignored_codes if c != code])
+                    st.rerun()
+        else:
+            st.info("No company codes are currently ignored — deduction applies to everyone.")
+
+        add_col1, add_col2 = st.columns([4, 1])
+        new_ignore_code = add_col1.text_input("Add a company code to ignore", key="new_ignore_cc_input")
+        if add_col2.button("Add", key="add_ignore_cc_btn"):
+            new_code_clean = new_ignore_code.strip().upper()
+            if not new_code_clean:
+                st.warning("Enter a company code first.")
+            elif new_code_clean in ignored_codes:
+                st.warning(f"'{new_code_clean}' is already in the ignore list.")
+            else:
+                save_ignored_company_codes(ignored_codes + [new_code_clean])
+                st.success(f"Added '{new_code_clean}' to the ignore list.")
+                st.rerun()
+
     st.markdown("#### Upload Employee Master Data")
     st.caption(
         "Columns required: **ERP, Name, Joining Date, Company Code, Branch, Earned Salary**. "
-        "Do not deduct from employees with Company Code = IGNITE. "
+        "Employees whose Company Code is in the ignore list above will not have deduction applied. "
         "**Joining Date is mandatory** to calculate deduction eligibility and expected release date."
     )
 
@@ -216,7 +255,7 @@ with tab_tracker:
 
         st.markdown("#### Configure Retention Settings")
 
-        ret_col1, ret_col2, ret_col3 = st.columns(3)
+        ret_col1, ret_col2 = st.columns(2)
         with ret_col1:
             deduction_pct = st.number_input(
                 "Deduction Percentage (%)",
@@ -226,13 +265,6 @@ with tab_tracker:
                 key="deduction_pct",
             )
         with ret_col2:
-            exclude_ignite = st.checkbox(
-                "Exclude IGNITE Company Code",
-                value=True,
-                key="exclude_ignite",
-                help="If checked, employees with Company Code = IGNITE will not have deductions applied.",
-            )
-        with ret_col3:
             # Minimum tenure in months to apply deduction
             min_tenure = st.number_input(
                 "Minimum Tenure (months) to Apply Deduction",
@@ -241,6 +273,12 @@ with tab_tracker:
                 key="min_tenure",
                 help="Employees with tenure less than this will not have deductions applied.",
             )
+
+        current_ignored = load_ignored_company_codes()
+        st.caption(
+            f"Ignored company codes currently applied: **{', '.join(current_ignored) if current_ignored else 'None'}** "
+            "(manage above)."
+        )
 
         st.markdown("#### Filter by Branch (Optional)")
 
@@ -268,7 +306,7 @@ with tab_tracker:
                     branch_col=branch_col,
                     salary_col=salary_col,
                     deduction_pct=deduction_pct,
-                    ignite_excluded=exclude_ignite,
+                    ignored_company_codes=load_ignored_company_codes(),
                 )
 
                 # Categorize retention status
@@ -364,6 +402,79 @@ with tab_tracker:
             else:
                 st.info("No employees with pending releases.")
 
+            # ------------------------------------------------------------
+            # Internal Transfers: employee issued a NEW ERP on transfer
+            # ------------------------------------------------------------
+            st.markdown("#### Internal Transfers (Branch/Company Change with New ERP)")
+            st.caption(
+                "If an employee moved branches (and/or company code) and was issued a **new ERP**, "
+                "upload the Old ERP → New ERP mapping below. Any deduction still **Pending Release** "
+                "under the old ERP is moved to the new ERP, so the eventual release happens against "
+                "the employee's current ERP, not the old one."
+            )
+
+            transfer_sample = sample_erp_transfer_template()
+            st.dataframe(transfer_sample, use_container_width=True)
+            st.download_button(
+                "⬇️ Download transfer mapping template",
+                data=to_excel_bytes({"Template": transfer_sample}),
+                file_name="internal_transfer_template.xlsx",
+                key="dl_transfer_template",
+            )
+
+            transfer_file = st.file_uploader(
+                "Upload Internal Transfer Mapping (.xlsx or .csv)",
+                type=["xlsx", "xls", "csv"],
+                key="internal_transfer_upload",
+            )
+
+            if transfer_file:
+                st.session_state["internal_transfers"] = read_any_table(transfer_file)
+                st.success(f"Loaded {len(st.session_state['internal_transfers'])} transfer record(s).")
+
+            if "internal_transfers" in st.session_state and not st.session_state["internal_transfers"].empty:
+                transfers_df = st.session_state["internal_transfers"]
+
+                old_erp_t_col = auto_detect_column(transfers_df, ["old erp"])
+                new_erp_t_col = auto_detect_column(transfers_df, ["new erp"])
+                new_branch_t_col = auto_detect_column(transfers_df, ["new branch"])
+                new_cc_t_col = auto_detect_column(transfers_df, ["new company", "new cc"])
+
+                st.caption(
+                    f"Detected columns → Old ERP: `{old_erp_t_col}` · New ERP: `{new_erp_t_col}` · "
+                    f"New Branch: `{new_branch_t_col}` · New Company Code: `{new_cc_t_col}`"
+                )
+
+                if st.button("Apply Internal Transfers", key="apply_transfers"):
+                    try:
+                        updated_result = apply_internal_transfers(
+                            st.session_state["retention_result"],
+                            transfers_df,
+                            erp_col=erp_col,
+                            old_erp_col=old_erp_t_col,
+                            new_erp_col=new_erp_t_col,
+                            branch_col=branch_col,
+                            new_branch_col=new_branch_t_col,
+                            cc_col=cc_col,
+                            new_cc_col=new_cc_t_col,
+                        )
+                        st.session_state["retention_result"] = updated_result
+                        st.success("✅ Internal transfers applied. Pending deductions now follow the new ERP.")
+                        st.rerun()
+                    except Exception as e:
+                        _show_error(e, "applying internal transfers")
+
+                if "Transferred" in result.columns and result["Transferred"].any():
+                    st.markdown("##### Employees Transferred (New ERP applied)")
+                    transferred_view_cols = [
+                        c for c in ["Previous ERP", erp_col, name_col, branch_col, cc_col, "Deduction Amount", "Status"]
+                        if c in result.columns
+                    ]
+                    st.dataframe(
+                        result[result["Transferred"] == True][transferred_view_cols],
+                        use_container_width=True,
+                    )
+
             # Download results
             st.markdown("#### Download Report")
             download_button_for_df(
@@ -415,20 +526,6 @@ with tab_dashboard:
             avg_deduction = result[result["Deduction Amount"] > 0]["Deduction Amount"].mean()
             st.metric("Average Deduction per Employee (with deduction)", f"₹{avg_deduction:,.0f}")
 
-        # Status Distribution
-        st.markdown("### Status Distribution")
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.markdown("#### Deduction Status Breakdown")
-            status_counts = result["Status"].value_counts()
-            st.bar_chart(status_counts)
-
-        with col2:
-            st.markdown("#### Deduction Applicable")
-            applicable_counts = result["Deduction Applicable"].value_counts().map({True: "Applicable", False: "Not Applicable"})
-            st.bar_chart(applicable_counts)
-
         # Company Code Analysis
         st.markdown("### Analysis by Company Code")
         cc_col = "Company Code"
@@ -442,16 +539,6 @@ with tab_dashboard:
 
             st.dataframe(cc_summary, use_container_width=True)
 
-            # Chart: Total Deduction by Company Code
-            st.markdown("#### Total Deduction by Company Code")
-            cc_chart_data = result.groupby(cc_col)["Deduction Amount"].sum().sort_values(ascending=False)
-            st.bar_chart(cc_chart_data)
-
-            # Chart: Pending vs Completed by Company Code
-            st.markdown("#### Pending vs Completed by Company Code")
-            cc_status_data = result.groupby(cc_col)["Status"].apply(lambda x: (x == "Pending Release").sum()).sort_values(ascending=False)
-            st.bar_chart(cc_status_data)
-
         # Branch Analysis
         st.markdown("### Analysis by Branch")
         branch_col = "Branch"
@@ -464,16 +551,6 @@ with tab_dashboard:
             branch_summary = branch_summary.sort_values("Total Deduction", ascending=False)
 
             st.dataframe(branch_summary, use_container_width=True)
-
-            # Chart: Total Deduction by Branch
-            st.markdown("#### Total Deduction by Branch")
-            branch_chart_data = result.groupby(branch_col)["Deduction Amount"].sum().sort_values(ascending=False)
-            st.bar_chart(branch_chart_data)
-
-            # Chart: Pending vs Completed by Branch
-            st.markdown("#### Pending vs Completed by Branch")
-            branch_status_data = result.groupby(branch_col)["Status"].apply(lambda x: (x == "Pending Release").sum()).sort_values(ascending=False)
-            st.bar_chart(branch_status_data)
 
         # Salary Range Analysis
         st.markdown("### Deduction by Salary Range")
@@ -493,11 +570,6 @@ with tab_dashboard:
 
             st.dataframe(salary_summary, use_container_width=True)
 
-            # Chart
-            st.markdown("#### Distribution Across Salary Ranges")
-            salary_chart = result_copy.groupby("Salary Range")["Deduction Amount"].sum()
-            st.bar_chart(salary_chart)
-
         # Expected Release Date Analysis
         st.markdown("### Expected Release Date Analysis")
         if "Expected Release Date" in result.columns:
@@ -512,11 +584,6 @@ with tab_dashboard:
             if not release_summary.empty:
                 release_summary.columns = ["Total Deduction", "Employee Count"]
                 st.dataframe(release_summary, use_container_width=True)
-
-                # Chart: Expected Releases by Month
-                st.markdown("#### Expected Releases by Month")
-                release_chart = result_copy[result_copy["Status"] == "Pending Release"].groupby("Release Year-Month")["Deduction Amount"].sum()
-                st.bar_chart(release_chart)
 
         # Top Deduction Recipients
         st.markdown("### Top 10 Employees by Deduction Amount")
