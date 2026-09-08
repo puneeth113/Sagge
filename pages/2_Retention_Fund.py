@@ -1,10 +1,14 @@
-
 import os
 import importlib.util
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
+# NOTE: this single file replaces the previous
+# pages/2_Retention_Fund_Tracker.py and pages/2a_Retention_Dashboard.py.
+# Rename this file to pages/2_Retention_Fund.py so page numbering/ordering
+# in the sidebar stays consistent, and update Home.py's nav link to match
+# (see the Home.py update provided alongside this file).
 
 
 def _load_utils():
