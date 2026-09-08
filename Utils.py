@@ -5,6 +5,8 @@ each page) makes the app easier to maintain and test.
 """
 
 import io
+import os
+import json
 import pandas as pd
 import streamlit as st
 
@@ -283,6 +285,43 @@ DEFAULT_ABSENCE_THRESHOLDS = [
 # 2. Retention Fund Tracking
 # --------------------------------------------------------------------------
 
+# Company codes ignored (excluded) from retention fund deduction. Stored as
+# a small JSON file (same `data/` folder used for users.json /
+# pending_requests.json) so the list is a persistent, admin-managed setting
+# rather than something reset every browser session. IGNITE ships as the
+# default ignored code to match the original hard-coded behaviour.
+DEFAULT_IGNORED_COMPANY_CODES = ["IGNITE"]
+
+_APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.join(_APP_ROOT, "..", "data")
+_IGNORED_CC_FILE = os.path.join(_DATA_DIR, "ignored_company_codes.json")
+
+
+def load_ignored_company_codes() -> list:
+    """Returns the current list of Company Codes to exclude from retention
+    fund deduction. Falls back to DEFAULT_IGNORED_COMPANY_CODES if the file
+    doesn't exist yet or can't be parsed."""
+    if not os.path.exists(_IGNORED_CC_FILE):
+        return list(DEFAULT_IGNORED_COMPANY_CODES)
+    try:
+        with open(_IGNORED_CC_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and all(isinstance(c, str) for c in data):
+            return data
+    except Exception:
+        pass
+    return list(DEFAULT_IGNORED_COMPANY_CODES)
+
+
+def save_ignored_company_codes(codes: list):
+    """Persists the ignored-company-codes list (deduplicated, uppercased,
+    sorted for a stable display order)."""
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    clean = sorted({str(c).strip().upper() for c in codes if str(c).strip()})
+    with open(_IGNORED_CC_FILE, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2)
+
+
 def sample_employee_master_for_retention() -> pd.DataFrame:
     """Sample employee master sheet for retention fund tracking.
     
@@ -362,7 +401,7 @@ def compute_retention_fund_deduction(
     branch_col: str,
     salary_col: str,
     deduction_pct: float = 10.0,
-    ignite_excluded: bool = True,
+    ignored_company_codes: list = None,
 ) -> pd.DataFrame:
     """Compute 10% retention fund deduction on earned gross salary.
     
@@ -374,7 +413,10 @@ def compute_retention_fund_deduction(
         branch_col: Column name for branch
         salary_col: Column name for earned salary
         deduction_pct: Deduction percentage (default 10%)
-        ignite_excluded: If True, exclude IGNITE company code from deduction
+        ignored_company_codes: Company codes to exclude from deduction
+            entirely (case-insensitive). Pass the list from
+            load_ignored_company_codes() to respect the admin-managed
+            ignore list. None / empty list applies deduction to everyone.
     
     Returns:
         DataFrame with retention fund calculations
@@ -384,9 +426,10 @@ def compute_retention_fund_deduction(
     # Coerce salary column to numeric
     out[salary_col] = coerce_numeric_column(out[salary_col], salary_col)
     
-    # Determine if deduction applies (exclude IGNITE by default)
-    if ignite_excluded:
-        out["Deduction Applicable"] = out[cc_col].astype(str).str.upper() != "IGNITE"
+    # Determine if deduction applies (anyone in the ignore list is excluded)
+    ignored_upper = {str(c).strip().upper() for c in (ignored_company_codes or []) if str(c).strip()}
+    if ignored_upper:
+        out["Deduction Applicable"] = ~out[cc_col].astype(str).str.upper().isin(ignored_upper)
     else:
         out["Deduction Applicable"] = True
     
@@ -500,6 +543,103 @@ def merge_internal_transfers(
             out.at[idx, "Company Code"] = transfer_info["new_cc"]
             out.at[idx, "Transferred"] = True
     
+    return out
+
+
+def sample_erp_transfer_template() -> pd.DataFrame:
+    """Sample data for tracking employees who were issued a NEW ERP ID after
+    an internal branch/company-code transfer.
+
+    Use this (rather than sample_internal_transfer_template, which assumes
+    the ERP stays the same) whenever the employee's ERP itself changes on
+    transfer — any retention fund deduction still pending release under the
+    Old ERP needs to move to the New ERP so the eventual release happens
+    against the employee's current identity.
+    """
+    return pd.DataFrame([
+        {
+            "Old ERP": "E001",
+            "New ERP": "E101",
+            "Name": "Ravi Kumar",
+            "Old Branch": "Koramangala",
+            "New Branch": "Whitefield",
+            "Old Company Code": "MAIN",
+            "New Company Code": "MAIN",
+        },
+        {
+            "Old ERP": "E002",
+            "New ERP": "E102",
+            "Name": "Sita Sharma",
+            "Old Branch": "Koramangala",
+            "New Branch": "Bangalore",
+            "Old Company Code": "MAIN",
+            "New Company Code": "IGNITE",
+        },
+    ])
+
+
+def apply_internal_transfers(
+    result_df: pd.DataFrame,
+    transfers_df: pd.DataFrame,
+    erp_col: str,
+    old_erp_col: str,
+    new_erp_col: str,
+    branch_col: str = None,
+    new_branch_col: str = None,
+    cc_col: str = None,
+    new_cc_col: str = None,
+) -> pd.DataFrame:
+    """Applies an Old-ERP -> New-ERP transfer mapping to a retention fund
+    result table.
+
+    For every transfer row, any record in `result_df` whose ERP matches the
+    Old ERP has its ERP swapped to the New ERP. The original ERP is kept in
+    a 'Previous ERP' column for audit purposes, and a 'Transferred' flag is
+    set. When supplied and present in the transfer sheet, Branch / Company
+    Code are updated to the new values too.
+
+    This is what makes a deduction that is still 'Pending Release' follow
+    the employee to their new ERP: every downstream view (pending-release
+    list, dashboard, exports) reads off `result_df[erp_col]`, so once this
+    runs, the New ERP — not the old one — is what shows up, and is what the
+    eventual release gets paid out against.
+
+    Rows in `result_df` whose ERP does not appear in the Old ERP column are
+    left completely untouched.
+    """
+    out = result_df.copy()
+
+    if "Previous ERP" not in out.columns:
+        out["Previous ERP"] = None
+    if "Transferred" not in out.columns:
+        out["Transferred"] = False
+
+    out[erp_col] = out[erp_col].astype(str)
+
+    for _, row in transfers_df.iterrows():
+        old_erp = str(row.get(old_erp_col, "")).strip()
+        new_erp = str(row.get(new_erp_col, "")).strip()
+        if not old_erp or not new_erp:
+            continue
+
+        mask = out[erp_col] == old_erp
+        if not mask.any():
+            continue
+
+        out.loc[mask, "Previous ERP"] = old_erp
+        out.loc[mask, erp_col] = new_erp
+        out.loc[mask, "Transferred"] = True
+
+        if branch_col and new_branch_col and new_branch_col in transfers_df.columns:
+            new_branch = row.get(new_branch_col)
+            if pd.notna(new_branch) and str(new_branch).strip():
+                out.loc[mask, branch_col] = new_branch
+
+        if cc_col and new_cc_col and new_cc_col in transfers_df.columns:
+            new_cc = row.get(new_cc_col)
+            if pd.notna(new_cc) and str(new_cc).strip():
+                out.loc[mask, cc_col] = new_cc
+
     return out
 
 
