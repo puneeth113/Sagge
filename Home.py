@@ -77,11 +77,12 @@ with nav1:
 
 with nav2:
     with st.container(border=True):
-        st.markdown("##### 💰 Retention Fund Tracker")
-        st.caption("Manage employee retention fund deductions by company code and branch.")
-        col_a, col_b = st.columns(2)
-        col_a.page_link("pages/2_Retention_Fund_Tracker.py", label="Compute →", icon="📊")
-        col_b.page_link("pages/2a_Retention_Dashboard.py", label="Dashboard →", icon="📈")
+        st.markdown("##### 💰 Retention Fund")
+        st.caption(
+            "Manage employee retention fund deductions and view KPI/analytics — "
+            "Tracker and Dashboard are now sub-tabs on a single page."
+        )
+        st.page_link("pages/2_Retention_Fund.py", label="Open →", icon="💰")
 
 with nav3:
     with st.container(border=True):
