@@ -7,6 +7,7 @@ each page) makes the app easier to maintain and test.
 import io
 import os
 import json
+from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 
@@ -322,11 +323,97 @@ def save_ignored_company_codes(codes: list):
         json.dump(clean, f, indent=2)
 
 
+# --------------------------------------------------------------------------
+# Payroll cycle (26th of a month -> 25th of the next) & New Joiner tagging
+# --------------------------------------------------------------------------
+
+def get_payroll_cycle(reference_date=None) -> tuple:
+    """Returns (cycle_start, cycle_end) as date objects for the payroll
+    cycle containing `reference_date` (defaults to today). The payroll
+    cycle always runs from the 26th of a month through the 25th of the
+    following month, regardless of which year/month `reference_date` falls
+    in — so this stays correct across month/year boundaries without ever
+    needing a hard-coded cycle."""
+    if reference_date is None:
+        reference_date = date.today()
+    if isinstance(reference_date, datetime):
+        reference_date = reference_date.date()
+
+    if reference_date.day >= 26:
+        cycle_start = date(reference_date.year, reference_date.month, 26)
+        end_month = reference_date.month + 1
+        end_year = reference_date.year
+        if end_month > 12:
+            end_month = 1
+            end_year += 1
+        cycle_end = date(end_year, end_month, 25)
+    else:
+        start_month = reference_date.month - 1
+        start_year = reference_date.year
+        if start_month < 1:
+            start_month = 12
+            start_year -= 1
+        cycle_start = date(start_year, start_month, 26)
+        cycle_end = date(reference_date.year, reference_date.month, 25)
+
+    return cycle_start, cycle_end
+
+
+def tag_new_joiners(df: pd.DataFrame, joining_col: str, cycle_start, cycle_end) -> pd.DataFrame:
+    """Adds a boolean 'New Joiner' column: True when the employee's Joining
+    Date falls inside [cycle_start, cycle_end] — the payroll cycle being
+    processed (26th of a month to 25th of the next).
+
+    Retention fund deduction is meant to be triggered only for employees
+    who are new joiners in the cycle being processed: existing employees
+    were already deducted in an earlier cycle's run and shouldn't have the
+    deduction re-applied every time the master sheet is re-uploaded.
+    """
+    out = df.copy()
+    joining_dt = pd.to_datetime(out[joining_col], errors="coerce")
+    cycle_start_ts = pd.Timestamp(cycle_start)
+    cycle_end_ts = pd.Timestamp(cycle_end)
+    out["New Joiner"] = (joining_dt >= cycle_start_ts) & (joining_dt <= cycle_end_ts)
+    return out
+
+
+def format_date_ddmmmyyyy(value) -> str:
+    """Formats a date/datetime/parsable string as dd-mmm-yyyy, e.g.
+    '08-Sep-2026'. Returns '' for null/unparseable values rather than
+    raising, since this is purely a display helper."""
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, float) and pd.isna(value):
+            return ""
+        dt_value = pd.to_datetime(value)
+        if pd.isna(dt_value):
+            return ""
+        return dt_value.strftime("%d-%b-%Y")
+    except Exception:
+        return ""
+
+
+def pending_deduction_sentence(label: str, pending_df: pd.DataFrame, name_col: str) -> str:
+    """Turns a group of pending-release records into a readable sentence,
+    e.g. 'MAIN: 3 deductions pending.', 'IGNITE: No deductions pending.', or
+    'Whitefield: 1 deduction pending with employee Ravi Kumar.' when there's
+    exactly one (naming the employee since there's only one to name).
+    Handles singular/plural grammar automatically."""
+    count = len(pending_df)
+    if count == 0:
+        return f"**{label}**: No deductions pending."
+    if count == 1:
+        emp_name = pending_df.iloc[0][name_col] if name_col in pending_df.columns else "employee"
+        return f"**{label}**: 1 deduction pending with employee {emp_name}."
+    return f"**{label}**: {count} deductions pending."
+
+
 def sample_employee_master_for_retention() -> pd.DataFrame:
     """Sample employee master sheet for retention fund tracking.
     
     Columns: ERP, Name, Joining Date, Company Code (CC), Branch, 
-    CTC / Earned Salary
+    Gross Salary
     """
     return pd.DataFrame([
         {
@@ -335,7 +422,7 @@ def sample_employee_master_for_retention() -> pd.DataFrame:
             "Joining Date": "2020-01-15",
             "Company Code": "IGNITE",
             "Branch": "Koramangala",
-            "Earned Salary": 25000.00,
+            "Gross Salary": 25000.00,
         },
         {
             "ERP": "E002",
@@ -343,7 +430,7 @@ def sample_employee_master_for_retention() -> pd.DataFrame:
             "Joining Date": "2021-06-10",
             "Company Code": "MAIN",
             "Branch": "Koramangala",
-            "Earned Salary": 35000.00,
+            "Gross Salary": 35000.00,
         },
         {
             "ERP": "E003",
@@ -351,7 +438,7 @@ def sample_employee_master_for_retention() -> pd.DataFrame:
             "Joining Date": "2019-03-20",
             "Company Code": "MAIN",
             "Branch": "Whitefield",
-            "Earned Salary": 40000.00,
+            "Gross Salary": 40000.00,
         },
     ])
 
@@ -402,8 +489,10 @@ def compute_retention_fund_deduction(
     salary_col: str,
     deduction_pct: float = 10.0,
     ignored_company_codes: list = None,
+    new_joiner_only: bool = False,
+    new_joiner_col: str = "New Joiner",
 ) -> pd.DataFrame:
-    """Compute 10% retention fund deduction on earned gross salary.
+    """Compute retention fund deduction on earned gross salary.
     
     Args:
         df: Employee master DataFrame
@@ -411,12 +500,20 @@ def compute_retention_fund_deduction(
         name_col: Column name for employee name
         cc_col: Column name for company code (CC)
         branch_col: Column name for branch
-        salary_col: Column name for earned salary
+        salary_col: Column name for gross salary
         deduction_pct: Deduction percentage (default 10%)
         ignored_company_codes: Company codes to exclude from deduction
             entirely (case-insensitive). Pass the list from
             load_ignored_company_codes() to respect the admin-managed
             ignore list. None / empty list applies deduction to everyone.
+        new_joiner_only: If True, deduction is applied only to rows where
+            `new_joiner_col` is True — i.e. only employees who are new
+            joiners in the payroll cycle being processed. Use
+            tag_new_joiners() to add that column before calling this with
+            new_joiner_only=True. Existing employees (already deducted in
+            an earlier cycle) are left with no deduction this run.
+        new_joiner_col: Name of the boolean "is a new joiner" column to
+            check when new_joiner_only=True.
     
     Returns:
         DataFrame with retention fund calculations
@@ -429,9 +526,19 @@ def compute_retention_fund_deduction(
     # Determine if deduction applies (anyone in the ignore list is excluded)
     ignored_upper = {str(c).strip().upper() for c in (ignored_company_codes or []) if str(c).strip()}
     if ignored_upper:
-        out["Deduction Applicable"] = ~out[cc_col].astype(str).str.upper().isin(ignored_upper)
+        applicable = ~out[cc_col].astype(str).str.upper().isin(ignored_upper)
     else:
-        out["Deduction Applicable"] = True
+        applicable = pd.Series(True, index=out.index)
+
+    if new_joiner_only:
+        if new_joiner_col not in out.columns:
+            raise ValueError(
+                f"Column '{new_joiner_col}' not found. Call tag_new_joiners() to add it "
+                "before computing deduction with new_joiner_only=True."
+            )
+        applicable = applicable & out[new_joiner_col].astype(bool)
+
+    out["Deduction Applicable"] = applicable
     
     # Calculate deduction amount (only where applicable)
     out["Deduction Amount"] = 0.0
