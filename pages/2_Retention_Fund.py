@@ -1,28 +1,26 @@
 import os
+import re
 import importlib.util
 
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date
 
-# NOTE: this single file replaces the previous
-# pages/2_Retention_Fund_Tracker.py and pages/2a_Retention_Dashboard.py.
-# Internal Transfer handling has been removed entirely — the Customize
-# Dashboard tab is now the single place Branch / Company Code / Designation
-# / Employment Type / Retention Applicable live for each ERP, and retention
-# fund deduction is computed straight off each employee's First Hire Date
-# rather than a Joining-Date-in-cycle check.
+
+# This page is dedicated to Retention Fund only.
+# Internal Transfer logic is intentionally absent.
+# Eligibility is based on First Hire Date month + Customize Dashboard rules.
 
 
 def _load_utils():
-    """Loads utils.py by its exact file path (not via sys.path / package
-    resolution), so it works regardless of how Streamlit was launched, the
-    current working directory, or filename case (utils.py vs Utils.py)."""
+    """Load util.py/Utils.py from the app root without changing sys.path."""
     this_dir = os.path.dirname(os.path.abspath(__file__))
     root_dir = os.path.dirname(this_dir)
     candidates = [
+        os.path.join(this_dir, "util.py"),
         os.path.join(this_dir, "utils.py"),
         os.path.join(this_dir, "Utils.py"),
+        os.path.join(root_dir, "util.py"),
         os.path.join(root_dir, "utils.py"),
         os.path.join(root_dir, "Utils.py"),
     ]
@@ -33,8 +31,7 @@ def _load_utils():
             spec.loader.exec_module(mod)
             return mod
     raise FileNotFoundError(
-        "Could not find utils.py. Make sure it sits directly inside the "
-        "app's root folder (one level above 'pages/')."
+        "Could not find util.py/utils.py. Keep it in the app root, one level above pages/."
     )
 
 
@@ -45,514 +42,621 @@ download_button_for_df = _u.download_button_for_df
 to_excel_bytes = _u.to_excel_bytes
 safe_error_message = _u.safe_error_message
 render_clear_data_button = _u.render_clear_data_button
-format_date_ddmmmyyyy = _u.format_date_ddmmmyyyy
 pending_deduction_sentence = _u.pending_deduction_sentence
 
-load_ignored_company_codes = _u.load_ignored_company_codes
-save_ignored_company_codes = _u.save_ignored_company_codes
 load_exceptional_erps = _u.load_exceptional_erps
 save_exceptional_erps = _u.save_exceptional_erps
 
 EMPLOYMENT_TYPE_OPTIONS = _u.EMPLOYMENT_TYPE_OPTIONS
 RETENTION_APPLICABLE_OPTIONS = _u.RETENTION_APPLICABLE_OPTIONS
 CUSTOMIZE_DASHBOARD_COLUMNS = _u.CUSTOMIZE_DASHBOARD_COLUMNS
+CONSOLIDATED_PAYSHEET_COLUMNS = _u.CONSOLIDATED_PAYSHEET_COLUMNS
+
 load_customize_dashboard = _u.load_customize_dashboard
 save_customize_dashboard = _u.save_customize_dashboard
 sample_customize_dashboard_bulk_template = _u.sample_customize_dashboard_bulk_template
 merge_customize_dashboard_bulk_upload = _u.merge_customize_dashboard_bulk_upload
-
-CONSOLIDATED_PAYSHEET_COLUMNS = _u.CONSOLIDATED_PAYSHEET_COLUMNS
 sample_consolidated_paysheet_template = _u.sample_consolidated_paysheet_template
-compute_paysheet_deduction = _u.compute_paysheet_deduction
-consolidate_paysheet_months = _u.consolidate_paysheet_months
+normalise_employee_master = _u.normalise_employee_master
+process_consolidated_paysheets = _u.process_consolidated_paysheets
+build_retention_reports = _u.build_retention_reports
+
 
 st.set_page_config(page_title="Retention Fund", page_icon="💰", layout="wide")
 render_top_nav("Retention Fund")
 
 st.title("💰 Retention Fund")
 st.caption(
-    "Track employee retention fund deductions from consolidated monthly paysheets, based on each "
-    "employee's First Hire Date — with per-employee Branch / Designation / Employment Type / "
-    "Retention Applicable settings managed centrally in the Customize Dashboard."
+    "Retention is calculated from the employee's First Hire Date month. "
+    "Formula: min(10% of Monthly Gross, Net Pay). Internal Transfer logic is not used."
 )
 
 with st.expander("🔒 Data handling on this page", expanded=False):
     st.markdown(
-        "- Uploaded files are processed **only in memory** for this browser session — nothing is written "
-        "to disk, logged, or sent to any external service (except your saved Customize Dashboard / "
-        "Exceptional ERP / Ignored Company Code settings, which are small admin config files).\n"
-        "- Downloaded reports are automatically sanitized against Excel/CSV formula-injection payloads.\n"
-        "- Use the button below to explicitly wipe all cached paysheet data from this session once you're done."
+        "- Paysheets are processed in the current Streamlit session.\n"
+        "- Customize Dashboard and Exceptional ERP settings are saved as admin configuration.\n"
+        "- Downloaded Excel reports use the shared export sanitizer from util.py.\n"
+        "- Use the button below when you want to clear cached payroll data from this session."
     )
     render_clear_data_button()
 
 
-def _show_error(e: Exception, context: str):
-    """ValueError messages here are hand-written to be safe and helpful to
-    show directly (e.g. 'row 5 has a non-numeric value') — only truly
-    unexpected exceptions get the generic safe_error_message treatment."""
-    if isinstance(e, ValueError):
-        st.error(str(e))
+def _show_error(exc: Exception, context: str):
+    if isinstance(exc, ValueError):
+        st.error(str(exc))
     else:
-        st.error(safe_error_message(e, context=context))
+        st.error(safe_error_message(exc, context=context))
 
 
-def auto_detect_column(df: pd.DataFrame, keywords: list) -> str:
-    """Auto-detect column by matching keywords (case-insensitive)."""
-    for col in df.columns:
-        col_lower = col.lower()
+def auto_detect_column(df: pd.DataFrame, keywords: list):
+    """Return a matching column or None. Never silently fall back to column 1."""
+    if df is None or len(df.columns) == 0:
+        return None
+
+    columns = list(df.columns)
+    normalized = {str(c).strip().lower(): c for c in columns}
+    for keyword in keywords:
+        key = str(keyword).strip().lower()
+        if key in normalized:
+            return normalized[key]
+
+    for col in columns:
+        col_key = str(col).strip().lower()
         for keyword in keywords:
-            if keyword.lower() in col_lower:
+            key = str(keyword).strip().lower()
+            if key and key in col_key:
                 return col
-    return df.columns[0] if len(df.columns) > 0 else None
+    return None
 
 
-# ================================================================
-# SUB-NAVIGATION: Compute | Customize Dashboard | Analytics Dashboard
-# ================================================================
-tab_compute, tab_customize, tab_dashboard = st.tabs(
-    ["💰 Retention Fund Compute", "🛠️ Customize Dashboard", "📊 Analytics Dashboard"]
+def standardize_paysheet(raw_df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    """Convert common paysheet headings into the required four standard names."""
+    mapping = {
+        "ERP": auto_detect_column(raw_df, ["erp", "employee id", "employee code", "emp code"]),
+        "First Hire Date": auto_detect_column(
+            raw_df,
+            ["first hire date", "first hired date", "first hire", "first hired"],
+        ),
+        "Net Pay": auto_detect_column(raw_df, ["net pay", "net salary", "in-hand", "inhand"]),
+        "Monthly Gross": auto_detect_column(raw_df, ["monthly gross", "gross pay", "gross salary", "gross"]),
+    }
+    missing = [target for target, source in mapping.items() if source is None]
+    if missing:
+        raise ValueError(
+            f"{source_name} is missing required column(s): {', '.join(missing)}. "
+            "Required format: ERP, First Hire Date, Net Pay, Monthly Gross."
+        )
+
+    out = raw_df[[mapping[c] for c in CONSOLIDATED_PAYSHEET_COLUMNS]].copy()
+    out.columns = CONSOLIDATED_PAYSHEET_COLUMNS
+    return out
+
+
+def infer_month_from_filename(filename: str):
+    """Best-effort month detection for names like Paysheet_2026-09.xlsx or Sep-2026.xlsx."""
+    name = os.path.splitext(os.path.basename(filename or ""))[0]
+    match = re.search(r"(?<!\d)(20\d{2})[-_ ]?(0?[1-9]|1[0-2])(?!\d)", name)
+    if match:
+        return date(int(match.group(1)), int(match.group(2)), 1)
+
+    month_map = {
+        "jan": 1, "january": 1,
+        "feb": 2, "february": 2,
+        "mar": 3, "march": 3,
+        "apr": 4, "april": 4,
+        "may": 5,
+        "jun": 6, "june": 6,
+        "jul": 7, "july": 7,
+        "aug": 8, "august": 8,
+        "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10,
+        "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+    lower = name.lower()
+    year_match = re.search(r"(?<!\d)(20\d{2})(?!\d)", lower)
+    if year_match:
+        for token, month_number in month_map.items():
+            if re.search(rf"\b{re.escape(token)}\b", lower):
+                return date(int(year_match.group(1)), month_number, 1)
+    return date.today().replace(day=1)
+
+
+def _employee_master_from_session():
+    """Use the Employee Database module's existing session data without modifying it."""
+    employee_db = st.session_state.get("employee_db")
+    if isinstance(employee_db, pd.DataFrame):
+        return employee_db
+    return pd.DataFrame()
+
+
+def _download_report_pack(reports: dict):
+    nonempty = {name: df for name, df in reports.items() if isinstance(df, pd.DataFrame) and not df.empty}
+    if not nonempty:
+        return
+    st.download_button(
+        "⬇️ Download Complete Retention Report",
+        data=to_excel_bytes(nonempty),
+        file_name=f"retention_fund_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_complete_retention_report",
+    )
+
+
+# ======================================================================
+# Tabs
+# ======================================================================
+tab_compute, tab_customize, tab_exceptional, tab_dashboard = st.tabs(
+    [
+        "💰 Retention Fund Compute",
+        "🛠️ Customize Dashboard",
+        "🚫 Exceptional ERP",
+        "📊 Analytics Dashboard",
+    ]
 )
 
 
-# ================================================================
-# TAB 1: COMPUTE (Exceptional ERPs + Consolidated Paysheet upload + calc)
-# ================================================================
+# ======================================================================
+# TAB 1 — RETENTION FUND COMPUTE
+# ======================================================================
 with tab_compute:
-    step_col1, step_col2, step_col3 = st.columns(3)
-    step_col1.markdown("**① Exceptional ERP Cases**")
-    step_col2.markdown("**② Consolidated Paysheet Upload**")
-    step_col3.markdown("**③ Calculate & Report**")
-    st.divider()
-
-    # ------------------------------------------------------------
-    # STEP 1: Exceptional ERP Cases
-    # ------------------------------------------------------------
-    st.markdown("### Step 1: Exceptional ERP Cases")
+    st.markdown("### Consolidated Paysheet Compute")
     st.caption(
-        "ERPs listed here will **never** have a retention fund deduction applied, no matter what "
-        "Company Code or Retention Applicable is set to in the Customize Dashboard. Use this for "
-        "one-off exceptions (e.g. a settlement, a special contract)."
+        "Upload paysheets for different months. Each monthly file must contain only the required "
+        "financial fields: ERP, First Hire Date, Net Pay and Monthly Gross. Branch, Designation and "
+        "Company Code are automatically mapped from the Employee Database module."
     )
 
-    with st.expander("Manage exceptional ERPs", expanded=False):
-        exceptional_erps = load_exceptional_erps()
+    employee_master_raw = _employee_master_from_session()
+    employee_master = normalise_employee_master(employee_master_raw)
 
-        if exceptional_erps:
-            for i, erp in enumerate(exceptional_erps):
-                c1, c2 = st.columns([5, 1])
-                c1.write(f"• `{erp}`")
-                if c2.button("Remove", key=f"remove_exceptional_erp_{i}"):
-                    save_exceptional_erps([e for e in exceptional_erps if e != erp])
-                    st.rerun()
-        else:
-            st.info("No exceptional ERPs currently configured.")
+    status_c1, status_c2, status_c3 = st.columns(3)
+    status_c1.metric("Employee Master Rows", len(employee_master_raw) if isinstance(employee_master_raw, pd.DataFrame) else 0)
+    status_c2.metric("Usable ERP Mappings", len(employee_master))
+    status_c3.metric("Deduction Formula", "Min(10% Gross, Net Pay)")
 
-        add_col1, add_col2 = st.columns([4, 1])
-        new_erp = add_col1.text_input("Add an ERP to exclude", key="new_exceptional_erp_input")
-        if add_col2.button("Add", key="add_exceptional_erp_btn"):
-            new_erp_clean = new_erp.strip().upper()
-            if not new_erp_clean:
-                st.warning("Enter an ERP first.")
-            elif new_erp_clean in exceptional_erps:
-                st.warning(f"'{new_erp_clean}' is already excluded.")
-            else:
-                save_exceptional_erps(exceptional_erps + [new_erp_clean])
-                st.success(f"Added '{new_erp_clean}' to the exceptional ERP list.")
-                st.rerun()
+    if employee_master.empty:
+        st.warning(
+            "Employee Database mapping is not available or does not contain ERP, Branch, Designation and Company Code. "
+            "Paysheets can still be loaded, but affected ERPs will receive ₹0 deduction with status "
+            "'Employee Master Mapping Missing'."
+        )
 
-    current_exceptional = load_exceptional_erps()
-    st.caption(
-        f"Exceptional ERPs currently excluded: **{', '.join(current_exceptional) if current_exceptional else 'None'}**"
-    )
-
-    st.divider()
-
-    # ------------------------------------------------------------
-    # STEP 2: Consolidated Paysheet Upload (one file per month)
-    # ------------------------------------------------------------
-    st.markdown("### Step 2: Consolidated Paysheet Upload")
-    st.caption(
-        "Upload one paysheet file **per month**. Required columns: **ERP, First Hire Date, Net Pay, "
-        "Monthly Gross**. Retention fund deduction for that month = **min(10% of Monthly Gross, Net Pay)**, "
-        "and is only computed from the month of the employee's First Hire Date onward."
-    )
-
-    paysheet_sample = sample_consolidated_paysheet_template()
-    st.dataframe(paysheet_sample, use_container_width=True)
+    st.markdown("#### Required Paysheet Format")
+    sample = sample_consolidated_paysheet_template()
+    st.dataframe(sample, use_container_width=True)
     st.download_button(
-        "⬇️ Download sample paysheet template",
-        data=to_excel_bytes({"Template": paysheet_sample}),
-        file_name="consolidated_paysheet_template.xlsx",
-        key="dl_paysheet_template",
+        "⬇️ Download Paysheet Sample",
+        data=to_excel_bytes({"Template": sample}),
+        file_name="retention_consolidated_paysheet_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_retention_paysheet_template",
     )
 
     if "consolidated_paysheets" not in st.session_state:
-        st.session_state["consolidated_paysheets"] = []  # list of {"month": Timestamp, "df": DataFrame}
+        st.session_state["consolidated_paysheets"] = []
 
-    up_col1, up_col2 = st.columns([2, 3])
-    with up_col1:
-        paysheet_month_input = st.date_input(
-            "Payroll month for this file",
-            value=date.today().replace(day=1),
-            key="paysheet_month_input",
-            help="Pick any date inside the month this paysheet covers — only the month/year is used.",
-        )
-    with up_col2:
-        paysheet_file = st.file_uploader(
-            "Upload this month's paysheet (.xlsx or .csv)",
-            type=["xlsx", "xls", "csv"],
-            key="paysheet_file_uploader",
-        )
-
-    if st.button("➕ Add this month to the batch", key="add_paysheet_month_btn"):
-        if paysheet_file is None:
-            st.warning("Choose a file to upload first.")
-        else:
-            raw_df = read_any_table(paysheet_file)
-            month_ts = pd.Timestamp(paysheet_month_input).to_period("M").to_timestamp()
-            already = [
-                m for m in st.session_state["consolidated_paysheets"]
-                if m["month"] == month_ts
-            ]
-            if already:
-                st.warning(
-                    f"A paysheet for {month_ts.strftime('%b-%Y')} is already in the batch. "
-                    "Remove it below first if you want to replace it."
-                )
-            else:
-                st.session_state["consolidated_paysheets"].append({"month": month_ts, "df": raw_df})
-                st.success(f"Added {month_ts.strftime('%b-%Y')} paysheet ({len(raw_df)} rows) to the batch.")
-                st.rerun()
-
-    if st.session_state["consolidated_paysheets"]:
-        st.markdown("#### Months in this batch")
-        for i, entry in enumerate(sorted(st.session_state["consolidated_paysheets"], key=lambda e: e["month"])):
-            c1, c2, c3 = st.columns([2, 2, 1])
-            c1.write(f"**{entry['month'].strftime('%b-%Y')}**")
-            c2.write(f"{len(entry['df'])} rows")
-            if c3.button("Remove", key=f"remove_paysheet_month_{i}"):
-                st.session_state["consolidated_paysheets"] = [
-                    e for e in st.session_state["consolidated_paysheets"] if e["month"] != entry["month"]
-                ]
-                st.rerun()
-    else:
-        st.info("No paysheet months added yet.")
-
-    st.divider()
-
-    # ------------------------------------------------------------
-    # STEP 3: Calculate
-    # ------------------------------------------------------------
-    st.markdown("### Step 3: Calculate & Report")
-
-    deduction_pct = st.number_input(
-        "Deduction Percentage Cap (%)",
-        min_value=0.0,
-        max_value=100.0,
-        value=10.0,
-        key="deduction_pct",
-        help="Deduction each month = min(this % of Monthly Gross, that month's Net Pay).",
+    st.markdown("#### Bulk Upload Monthly Paysheets")
+    uploaded_files = st.file_uploader(
+        "Select one or more monthly paysheets",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+        key="retention_multi_paysheet_upload",
+        help="Tip: filenames such as Paysheet_2026-09.xlsx or Sep-2026.xlsx let the month pre-fill automatically.",
     )
 
-    if st.button("Calculate Consolidated Retention Fund", key="calc_retention", type="primary"):
-        if not st.session_state["consolidated_paysheets"]:
-            st.warning("Add at least one month's paysheet before calculating.")
+    file_months = []
+    if uploaded_files:
+        st.caption("Confirm the payroll month for each selected file before adding it to the batch.")
+        for index, uploaded in enumerate(uploaded_files):
+            default_month = infer_month_from_filename(uploaded.name)
+            safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", uploaded.name)[:70]
+            c1, c2 = st.columns([3, 2])
+            c1.write(f"**{uploaded.name}**")
+            selected_month = c2.date_input(
+                "Payroll month",
+                value=default_month,
+                key=f"retention_file_month_{index}_{safe_key}",
+                help="Only the month and year are used.",
+            )
+            file_months.append((uploaded, pd.Timestamp(selected_month).to_period("M").to_timestamp()))
+
+        if st.button("➕ Add Selected Paysheets to Batch", type="primary", key="add_selected_paysheets"):
+            try:
+                existing_months = {entry["month"] for entry in st.session_state["consolidated_paysheets"]}
+                selected_month_values = [month for _, month in file_months]
+                if len(selected_month_values) != len(set(selected_month_values)):
+                    raise ValueError("Two selected files have the same payroll month. Keep only one file per month.")
+
+                additions = []
+                for uploaded, month_ts in file_months:
+                    if month_ts in existing_months:
+                        raise ValueError(
+                            f"A paysheet for {month_ts.strftime('%b-%Y')} is already in the batch. "
+                            "Remove the existing month before replacing it."
+                        )
+                    uploaded.seek(0)
+                    raw = read_any_table(uploaded)
+                    standardized = standardize_paysheet(raw, uploaded.name)
+                    additions.append(
+                        {
+                            "month": month_ts,
+                            "data": standardized,
+                            "source": uploaded.name,
+                        }
+                    )
+
+                st.session_state["consolidated_paysheets"].extend(additions)
+                st.success(f"Added {len(additions)} monthly paysheet(s) to the batch.")
+                st.rerun()
+            except Exception as exc:
+                _show_error(exc, "adding paysheets to the consolidated batch")
+
+    st.markdown("#### Months Ready for Compute")
+    batch = st.session_state["consolidated_paysheets"]
+    if batch:
+        for index, entry in enumerate(sorted(batch, key=lambda item: item["month"])):
+            c1, c2, c3, c4 = st.columns([2, 3, 2, 1])
+            c1.write(f"**{entry['month'].strftime('%b-%Y')}**")
+            c2.write(entry.get("source", "Uploaded file"))
+            c3.write(f"{len(entry['data'])} rows")
+            if c4.button("Remove", key=f"remove_retention_batch_{entry['month'].strftime('%Y%m')}_{index}"):
+                st.session_state["consolidated_paysheets"] = [
+                    item for item in batch if item is not entry
+                ]
+                for result_key in [
+                    "consolidated_paysheet_summary",
+                    "consolidated_paysheet_result",
+                    "retention_reports",
+                ]:
+                    st.session_state.pop(result_key, None)
+                st.rerun()
+
+        if st.button("🗑️ Clear Paysheet Batch", key="clear_retention_batch"):
+            st.session_state["consolidated_paysheets"] = []
+            for result_key in [
+                "consolidated_paysheet_summary",
+                "consolidated_paysheet_result",
+                "retention_reports",
+            ]:
+                st.session_state.pop(result_key, None)
+            st.rerun()
+    else:
+        st.info("No monthly paysheets have been added yet.")
+
+    st.divider()
+    st.markdown("### Calculate Retention Fund")
+    customize_rules = load_customize_dashboard()
+    exceptional_erps = load_exceptional_erps()
+
+    ready_c1, ready_c2, ready_c3 = st.columns(3)
+    ready_c1.metric("Customize Rules", len(customize_rules))
+    ready_c2.metric("Exceptional ERPs", len(exceptional_erps))
+    ready_c3.metric("Paysheet Months", len(batch))
+
+    if customize_rules.empty:
+        st.warning(
+            "No Customize Dashboard rules are configured. Configure Branch + Company Code + Designation rules "
+            "before computing deductions; otherwise all mapped employees will be marked 'Customize Rule Missing'."
+        )
+
+    if st.button("Calculate Consolidated Retention Fund", type="primary", key="calculate_retention_fund"):
+        if not batch:
+            st.warning("Add at least one monthly paysheet before calculating.")
         else:
             try:
-                customize_df = load_customize_dashboard()
-                exceptional_erps = load_exceptional_erps()
-
-                monthly_results = []
-                for entry in st.session_state["consolidated_paysheets"]:
-                    raw_df = entry["df"]
-                    month_ts = entry["month"]
-
-                    erp_col = auto_detect_column(raw_df, ["erp", "emp id", "employee id"])
-                    first_hire_col = auto_detect_column(raw_df, ["first hire", "hire date", "doj", "joining"])
-                    net_pay_col = auto_detect_column(raw_df, ["net pay", "net salary", "in-hand", "inhand"])
-                    gross_col = auto_detect_column(raw_df, ["monthly gross", "gross"])
-
-                    missing = []
-                    if not erp_col:
-                        missing.append("ERP")
-                    if not first_hire_col:
-                        missing.append("First Hire Date")
-                    if not net_pay_col:
-                        missing.append("Net Pay")
-                    if not gross_col:
-                        missing.append("Monthly Gross")
-                    if missing:
-                        st.error(
-                            f"❌ {month_ts.strftime('%b-%Y')} paysheet is missing required column(s): "
-                            f"{', '.join(missing)}"
-                        )
-                        st.stop()
-
-                    month_result = compute_paysheet_deduction(
-                        raw_df,
-                        erp_col=erp_col,
-                        first_hire_col=first_hire_col,
-                        net_pay_col=net_pay_col,
-                        gross_col=gross_col,
-                        paysheet_month=month_ts,
-                        exceptional_erps=exceptional_erps,
-                        customize_dashboard=customize_df,
-                        deduction_pct=deduction_pct,
-                    )
-                    month_result = month_result.rename(columns={erp_col: "ERP"})
-                    monthly_results.append(month_result)
-
-                summary, combined = consolidate_paysheet_months(monthly_results, erp_col="ERP")
+                summary, combined = process_consolidated_paysheets(
+                    monthly_inputs=batch,
+                    exceptional_erps=exceptional_erps,
+                    customize_dashboard=customize_rules,
+                    employee_master=employee_master_raw,
+                    deduction_pct=10.0,
+                )
+                reports = build_retention_reports(summary, combined)
 
                 st.session_state["consolidated_paysheet_summary"] = summary
                 st.session_state["consolidated_paysheet_result"] = combined
+                st.session_state["retention_reports"] = reports
+
                 st.success(
-                    f"✅ Consolidated retention fund calculated across "
-                    f"{len(st.session_state['consolidated_paysheets'])} month(s) and {summary['ERP'].nunique()} employee(s)."
+                    f"Retention Fund computed for {summary['ERP'].nunique() if not summary.empty else 0} employee(s) "
+                    f"across {combined['Paysheet Month'].nunique() if not combined.empty else 0} month(s)."
                 )
-            except Exception as e:
-                _show_error(e, "calculating the consolidated retention fund")
+                st.rerun()
+            except Exception as exc:
+                _show_error(exc, "calculating the consolidated Retention Fund")
 
-    if "consolidated_paysheet_summary" in st.session_state and not st.session_state["consolidated_paysheet_summary"].empty:
-        summary = st.session_state["consolidated_paysheet_summary"]
-        combined = st.session_state["consolidated_paysheet_result"]
+    reports = st.session_state.get("retention_reports", {})
+    summary = st.session_state.get("consolidated_paysheet_summary", pd.DataFrame())
+    combined = st.session_state.get("consolidated_paysheet_result", pd.DataFrame())
 
+    if isinstance(summary, pd.DataFrame) and not summary.empty:
         st.divider()
-        st.markdown("### Report")
+        st.markdown("### Compute Result")
 
-        st.markdown("#### Consolidated Summary (per employee, across all uploaded months)")
-        st.dataframe(summary, use_container_width=True, height=400)
-
-        total_employees = summary["ERP"].nunique()
-        pending_mask = summary["Latest Status"] == "Pending Release"
-        pending_count = int(pending_mask.sum())
-        total_deduction = summary["Total Deduction Accumulated"].sum()
-
-        sum_col1, sum_col2, sum_col3 = st.columns(3)
-        sum_col1.metric("Employees in Report", total_employees)
-        sum_col2.metric("Pending Deductions", pending_count)
-        sum_col3.metric("Total Accumulated Deduction", f"₹{total_deduction:,.0f}")
-
-        st.markdown("#### Breakdown by Company Code")
-        if "Company Code" in summary.columns:
-            cc_summary = summary.groupby("Company Code").agg(
-                **{
-                    "Total Deduction": ("Total Deduction Accumulated", "sum"),
-                    "Pending Count": ("Latest Status", lambda x: (x == "Pending Release").sum()),
-                    "Employee Count": ("ERP", "count"),
-                }
-            )
-            st.dataframe(cc_summary, use_container_width=True)
-
-        st.markdown("#### Breakdown by Branch")
-        if "Branch" in summary.columns:
-            branch_summary = summary.groupby("Branch").agg(
-                **{
-                    "Total Deduction": ("Total Deduction Accumulated", "sum"),
-                    "Pending Count": ("Latest Status", lambda x: (x == "Pending Release").sum()),
-                    "Employee Count": ("ERP", "count"),
-                }
-            )
-            st.dataframe(branch_summary, use_container_width=True)
-
-        st.markdown("#### Pending Deductions Summary")
-        pending_all = summary[pending_mask]
-        st.markdown(pending_deduction_sentence("Overall", pending_all, "ERP"))
-
-        st.markdown("#### Employees with Pending Release")
-        pending_cols = [c for c in ["ERP", "Branch", "Designation", "Company Code", "Total Deduction Accumulated", "Months Processed"] if c in summary.columns]
-        pending_view = summary[pending_mask][pending_cols]
-        if not pending_view.empty:
-            st.dataframe(pending_view, use_container_width=True)
-        else:
-            st.info("No employees with pending releases.")
-
-        st.markdown("#### Month-wise Detail")
-        with st.expander("View month-by-month deduction detail", expanded=False):
-            st.dataframe(combined, use_container_width=True, height=400)
-
-        st.markdown("#### Download Report")
-        download_button_for_df(
-            summary,
-            "⬇️ Download Consolidated Summary",
-            f"retention_fund_consolidated_summary_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        total_retention = float(summary["Total Deduction Accumulated"].sum())
+        pending_employees = int((summary["Total Deduction Accumulated"] > 0).sum())
+        audit_employees = int(
+            summary["First Hire Date Variance"].fillna(False).sum()
+            + summary["First Hire Date Recovered"].fillna(False).sum()
         )
-        download_button_for_df(
-            combined,
-            "⬇️ Download Month-wise Detail",
-            f"retention_fund_monthwise_detail_{datetime.now().strftime('%Y%m%d')}.xlsx",
-            key="dl_monthwise",
-        )
-        if not pending_view.empty:
-            download_button_for_df(
-                pending_view,
-                "⬇️ Download Pending Releases",
-                f"retention_fund_pending_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                key="dl_pending",
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Employees", summary["ERP"].nunique())
+        m2.metric("Months Covered", combined["Paysheet Month"].nunique())
+        m3.metric("Total Retention", f"₹{total_retention:,.2f}")
+        m4.metric("Hire-Date Audit Flags", audit_employees)
+
+        st.dataframe(summary, use_container_width=True, height=420)
+        _download_report_pack(reports)
+
+        pending_df = reports.get("Pending Releases", pd.DataFrame())
+        if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
+            st.markdown("#### Pending Releases")
+            pending_view_columns = [
+                c for c in [
+                    "ERP", "Paysheet Month", "First Hire Date", "Branch", "Designation",
+                    "Company Code", "Employment Type", "Monthly Gross", "Net Pay",
+                    "Deduction Amount", "Status",
+                ] if c in pending_df.columns
+            ]
+            st.dataframe(pending_df[pending_view_columns], use_container_width=True)
+
+        exception_df = reports.get("Exceptions - No Deduction", pd.DataFrame())
+        if isinstance(exception_df, pd.DataFrame) and not exception_df.empty:
+            with st.expander("View No-Deduction / Exception Rows", expanded=False):
+                st.dataframe(exception_df, use_container_width=True)
+
+        audit_df = reports.get("First Hire Date Audit", pd.DataFrame())
+        if isinstance(audit_df, pd.DataFrame) and not audit_df.empty:
+            st.warning(
+                "Some ERPs have inconsistent or recovered First Hire Dates. The system used the earliest valid "
+                "First Hire Date across uploaded months as the canonical date. Review the audit below."
             )
+            with st.expander("First Hire Date Audit", expanded=True):
+                audit_cols = [
+                    c for c in [
+                        "ERP", "Source File", "Paysheet Month", "Uploaded First Hire Date",
+                        "First Hire Date", "First Hire Date Variance", "First Hire Date Recovered", "Status",
+                    ] if c in audit_df.columns
+                ]
+                st.dataframe(audit_df[audit_cols], use_container_width=True)
 
 
-# ================================================================
-# TAB 2: CUSTOMIZE DASHBOARD
-# ================================================================
+# ======================================================================
+# TAB 2 — CUSTOMIZE DASHBOARD
+# ======================================================================
 with tab_customize:
     st.markdown("### Customize Dashboard")
     st.caption(
-        "The per-employee profile that drives reporting and retention eligibility: Branch, Designation, "
-        "Employment Type, Company Code, and whether Retention Fund is Applicable (Yes/No). "
-        "An ERP with no profile here, or **Retention Applicable = No**, will never get a deduction."
+        "Configure retention applicability by Branch + Company Code + Designation. Employment Type and "
+        "Retention Applicable are dropdown fields. This table is not ERP-based."
     )
 
-    st.markdown("#### Bulk Upload (Branch, Company Code, Designation)")
-    st.caption(
-        "Upload a file with **ERP, Branch, Company Code, Designation** only — Employment Type and "
-        "Retention Applicable are managed as dropdowns in the table below and are **not** overwritten "
-        "by a bulk upload for ERPs that already have a value set; brand-new ERPs default to "
-        "'Full Time' / 'Yes' until you change them."
+    st.markdown("#### Bulk Upload")
+    st.write(
+        "Bulk file columns: **Branch, Company Code, Designation** only. "
+        "For new combinations the system automatically creates **Employment Type = Full Time** and "
+        "**Retention Applicable = Yes**; both can then be changed using dropdowns."
     )
 
-    bulk_sample = sample_customize_dashboard_bulk_template()
-    st.dataframe(bulk_sample, use_container_width=True)
+    customize_sample = sample_customize_dashboard_bulk_template()
+    st.dataframe(customize_sample, use_container_width=True)
     st.download_button(
-        "⬇️ Download bulk upload template",
-        data=to_excel_bytes({"Template": bulk_sample}),
+        "⬇️ Download Customize Bulk Template",
+        data=to_excel_bytes({"Template": customize_sample}),
         file_name="customize_dashboard_bulk_template.xlsx",
-        key="dl_customize_bulk_template",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_customize_dashboard_template",
     )
 
-    bulk_file = st.file_uploader(
-        "Upload Branch / Company Code / Designation (.xlsx or .csv)",
+    customize_file = st.file_uploader(
+        "Upload Customize Rules",
         type=["xlsx", "xls", "csv"],
-        key="customize_bulk_upload",
+        key="customize_rule_upload",
     )
 
-    if bulk_file:
-        try:
-            bulk_df = read_any_table(bulk_file)
-            erp_col = auto_detect_column(bulk_df, ["erp", "emp id", "employee id"])
-            branch_col = auto_detect_column(bulk_df, ["branch"])
-            cc_col = auto_detect_column(bulk_df, ["cc", "company code", "company"])
-            designation_col = auto_detect_column(bulk_df, ["designation", "role", "title"])
+    if customize_file is not None:
+        if st.button("Upload / Merge Customize Rules", key="merge_customize_rules", type="primary"):
+            try:
+                customize_file.seek(0)
+                uploaded_rules = read_any_table(customize_file)
+                branch_col = auto_detect_column(uploaded_rules, ["branch"])
+                company_col = auto_detect_column(uploaded_rules, ["company code", "company", "cc"])
+                designation_col = auto_detect_column(uploaded_rules, ["designation", "role", "title"])
 
-            missing = []
-            if not erp_col:
-                missing.append("ERP")
-            if not branch_col:
-                missing.append("Branch")
-            if not cc_col:
-                missing.append("Company Code")
-            if not designation_col:
-                missing.append("Designation")
+                missing = []
+                if branch_col is None:
+                    missing.append("Branch")
+                if company_col is None:
+                    missing.append("Company Code")
+                if designation_col is None:
+                    missing.append("Designation")
+                if missing:
+                    raise ValueError(f"Customize file is missing required column(s): {', '.join(missing)}")
 
-            if missing:
-                st.error(f"❌ Missing required columns: {', '.join(missing)}")
-            else:
-                existing = load_customize_dashboard()
                 merged = merge_customize_dashboard_bulk_upload(
-                    existing, bulk_df,
-                    erp_col=erp_col, branch_col=branch_col, cc_col=cc_col, designation_col=designation_col,
+                    existing_df=load_customize_dashboard(),
+                    upload_df=uploaded_rules,
+                    branch_col=branch_col,
+                    cc_col=company_col,
+                    designation_col=designation_col,
                 )
                 save_customize_dashboard(merged)
-                st.success(f"✅ Merged {len(bulk_df)} row(s) into the Customize Dashboard ({len(merged)} total employees).")
+                st.success(f"Customize Dashboard updated. Total active rules: {len(merged)}.")
                 st.rerun()
-        except Exception as e:
-            _show_error(e, "processing the bulk upload")
+            except Exception as exc:
+                _show_error(exc, "processing Customize Dashboard rules")
 
     st.divider()
+    st.markdown("#### Rule Table")
+    rules_df = load_customize_dashboard()
+    if rules_df.empty:
+        rules_df = pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
 
-    st.markdown("#### Employee Profiles")
-    st.caption(
-        "Edit Employment Type and Retention Applicable directly below (dropdowns). Add a brand-new "
-        "ERP by typing into the blank row at the bottom. Click **Save Changes** when done."
-    )
-
-    dashboard_df = load_customize_dashboard()
-    if dashboard_df.empty:
-        dashboard_df = pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
-
-    edited_df = st.data_editor(
-        dashboard_df,
+    edited_rules = st.data_editor(
+        rules_df,
         use_container_width=True,
         num_rows="dynamic",
         key="customize_dashboard_editor",
         column_config={
+            "Branch": st.column_config.TextColumn("Branch", required=True),
+            "Designation": st.column_config.TextColumn("Designation", required=True),
             "Employment Type": st.column_config.SelectboxColumn(
-                "Employment Type", options=EMPLOYMENT_TYPE_OPTIONS, required=False,
+                "Employment Type",
+                options=EMPLOYMENT_TYPE_OPTIONS,
+                required=True,
             ),
+            "Company Code": st.column_config.TextColumn("Company Code", required=True),
             "Retention Applicable": st.column_config.SelectboxColumn(
-                "Retention Applicable", options=RETENTION_APPLICABLE_OPTIONS, required=False,
+                "Retention Applicable",
+                options=RETENTION_APPLICABLE_OPTIONS,
+                required=True,
             ),
         },
     )
 
-    if st.button("💾 Save Changes", key="save_customize_dashboard_btn"):
-        save_customize_dashboard(edited_df)
-        st.success("Customize Dashboard saved.")
-        st.rerun()
+    if st.button("💾 Save Customize Dashboard", key="save_customize_dashboard", type="primary"):
+        try:
+            save_customize_dashboard(edited_rules)
+            st.success("Customize Dashboard saved.")
+            # Existing compute result may no longer match changed rules.
+            for result_key in [
+                "consolidated_paysheet_summary",
+                "consolidated_paysheet_result",
+                "retention_reports",
+            ]:
+                st.session_state.pop(result_key, None)
+            st.rerun()
+        except Exception as exc:
+            _show_error(exc, "saving Customize Dashboard")
 
 
-# ================================================================
-# TAB 3: ANALYTICS DASHBOARD
-# ================================================================
-with tab_dashboard:
-    st.markdown("#### Dashboard Overview")
+# ======================================================================
+# TAB 3 — EXCEPTIONAL ERP
+# ======================================================================
+with tab_exceptional:
+    st.markdown("### Exceptional ERP Cases")
+    st.caption(
+        "An ERP listed here will never have a Retention Fund deduction. This exclusion overrides a matching "
+        "Customize Dashboard rule and Retention Applicable = Yes."
+    )
 
-    if "consolidated_paysheet_summary" in st.session_state and not st.session_state["consolidated_paysheet_summary"].empty:
-        summary = st.session_state["consolidated_paysheet_summary"]
-        combined = st.session_state["consolidated_paysheet_result"]
-
-        total_employees = summary["ERP"].nunique()
-        pending_mask = summary["Latest Status"] == "Pending Release"
-        pending_count = int(pending_mask.sum())
-        total_deduction = summary["Total Deduction Accumulated"].sum()
-        months_covered = combined["Paysheet Month"].nunique() if "Paysheet Month" in combined.columns else 0
-
-        st.markdown("### Key Metrics")
-        kcol1, kcol2, kcol3, kcol4 = st.columns(4)
-        kcol1.metric("Employees in Report", total_employees)
-        kcol2.metric("Months Covered", months_covered)
-        kcol3.metric("Total Deduction Accumulated", f"₹{total_deduction:,.0f}")
-        kcol4.metric("Employees Awaiting Release", pending_count)
-
-        st.markdown(pending_deduction_sentence("Overall", summary[pending_mask], "ERP"))
-
-        st.markdown("### Employment Type Breakdown")
-        if "Employment Type" in summary.columns:
-            et_summary = summary.groupby("Employment Type").agg(
-                **{
-                    "Total Deduction": ("Total Deduction Accumulated", "sum"),
-                    "Employee Count": ("ERP", "count"),
-                }
-            )
-            st.dataframe(et_summary, use_container_width=True)
-
-        st.markdown("### Monthly Trend")
-        if "Paysheet Month" in combined.columns:
-            monthly_trend = (
-                combined.groupby(combined["Paysheet Month"].dt.strftime("%b-%Y"))["Deduction Amount"]
-                .sum()
-                .rename("Total Deduction")
-            )
-            st.bar_chart(monthly_trend)
-
-        st.markdown("### Download Reports")
-        download_button_for_df(
-            summary,
-            "⬇️ Download Full Dashboard Summary",
-            f"retention_dashboard_summary_{datetime.now().strftime('%Y%m%d')}.xlsx",
-            key="dl_dashboard_full",
-        )
-        pending_df = summary[pending_mask]
-        if not pending_df.empty:
-            download_button_for_df(
-                pending_df,
-                "⬇️ Download Pending Releases Report",
-                f"retention_pending_releases_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                key="dl_pending_releases",
-            )
+    exceptional = load_exceptional_erps()
+    if exceptional:
+        exceptional_df = pd.DataFrame({"ERP": exceptional})
+        st.dataframe(exceptional_df, use_container_width=True, hide_index=True)
     else:
-        st.info(
-            "📌 No retention fund data available. Upload paysheets and calculate from the "
-            "**Retention Fund Compute** tab first."
+        st.info("No exceptional ERPs configured.")
+
+    add_c1, add_c2 = st.columns([4, 1])
+    new_exceptional_erp = add_c1.text_input(
+        "ERP to exclude",
+        key="new_exceptional_erp",
+        placeholder="Example: ERP00123",
+    )
+    if add_c2.button("Add ERP", key="add_exceptional_erp"):
+        erp = new_exceptional_erp.strip().upper()
+        if not erp:
+            st.warning("Enter an ERP first.")
+        elif erp in exceptional:
+            st.warning(f"{erp} is already in the exceptional list.")
+        else:
+            save_exceptional_erps(exceptional + [erp])
+            for result_key in [
+                "consolidated_paysheet_summary",
+                "consolidated_paysheet_result",
+                "retention_reports",
+            ]:
+                st.session_state.pop(result_key, None)
+            st.success(f"{erp} added as an exceptional ERP.")
+            st.rerun()
+
+    if exceptional:
+        remove_erp = st.selectbox(
+            "Select ERP to remove from exception list",
+            options=[""] + exceptional,
+            key="remove_exceptional_erp_select",
         )
+        if st.button("Remove Selected ERP", key="remove_exceptional_erp"):
+            if not remove_erp:
+                st.warning("Select an ERP first.")
+            else:
+                save_exceptional_erps([erp for erp in exceptional if erp != remove_erp])
+                for result_key in [
+                    "consolidated_paysheet_summary",
+                    "consolidated_paysheet_result",
+                    "retention_reports",
+                ]:
+                    st.session_state.pop(result_key, None)
+                st.success(f"{remove_erp} removed from the exceptional ERP list.")
+                st.rerun()
+
+
+# ======================================================================
+# TAB 4 — ANALYTICS DASHBOARD
+# ======================================================================
+with tab_dashboard:
+    st.markdown("### Analytics Dashboard")
+    reports = st.session_state.get("retention_reports", {})
+    summary = st.session_state.get("consolidated_paysheet_summary", pd.DataFrame())
+    combined = st.session_state.get("consolidated_paysheet_result", pd.DataFrame())
+
+    if not isinstance(summary, pd.DataFrame) or summary.empty:
+        st.info(
+            "No calculated Retention Fund data is available. Add monthly paysheets and run the calculation "
+            "from the Retention Fund Compute tab."
+        )
+    else:
+        total_retention = float(summary["Total Deduction Accumulated"].sum())
+        employees_with_deduction = int((summary["Total Deduction Accumulated"] > 0).sum())
+        exceptional_rows = int(combined["Exceptional ERP"].fillna(False).sum())
+        missing_mapping_rows = int(combined["Employee Master Mapping Missing"].fillna(False).sum())
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Employees", summary["ERP"].nunique())
+        k2.metric("Employees With Deduction", employees_with_deduction)
+        k3.metric("Total Retention Fund", f"₹{total_retention:,.2f}")
+        k4.metric("Months Covered", combined["Paysheet Month"].nunique())
+
+        q1, q2 = st.columns(2)
+        q1.metric("Exceptional ERP Rows", exceptional_rows)
+        q2.metric("Missing Mapping Rows", missing_mapping_rows)
+
+        monthly_summary = reports.get("Monthly Summary", pd.DataFrame())
+        if isinstance(monthly_summary, pd.DataFrame) and not monthly_summary.empty:
+            st.markdown("#### Monthly Trend")
+            trend = monthly_summary.set_index("Paysheet Month")["Total_Retention_Fund"]
+            st.bar_chart(trend)
+            st.dataframe(monthly_summary, use_container_width=True)
+
+        report_tabs = st.tabs(
+            [
+                "Branch",
+                "Designation",
+                "Company",
+                "Employment Type",
+                "Status",
+                "Missing Mapping",
+                "First Hire Audit",
+            ]
+        )
+        report_names = [
+            "Branch Summary",
+            "Designation Summary",
+            "Company Summary",
+            "Employment Type Summary",
+            "Status Summary",
+            "Missing Mapping",
+            "First Hire Date Audit",
+        ]
+        for report_tab, report_name in zip(report_tabs, report_names):
+            with report_tab:
+                report_df = reports.get(report_name, pd.DataFrame())
+                if isinstance(report_df, pd.DataFrame) and not report_df.empty:
+                    st.dataframe(report_df, use_container_width=True, height=420)
+                else:
+                    st.info(f"No data available for {report_name}.")
+
+        st.markdown("#### Download Reports")
+        _download_report_pack(reports)
