@@ -309,7 +309,7 @@ _IGNORED_CC_FILE = os.path.join(_DATA_DIR, "ignored_company_codes.json")
 _EXCEPTIONAL_ERP_FILE = os.path.join(_DATA_DIR, "exceptional_erps.json")
 _CUSTOMIZE_DASHBOARD_FILE = os.path.join(_DATA_DIR, "customize_dashboard.json")
 
-EMPLOYMENT_TYPE_OPTIONS = ["Full Time", "Contractual", "Part Time"]
+EMPLOYMENT_TYPE_OPTIONS = ["Full Time", "Gig Worker", "Consultant"]
 RETENTION_APPLICABLE_OPTIONS = ["Yes", "No"]
 
 CUSTOMIZE_KEY_COLUMNS = ["Branch", "Company Code", "Designation"]
@@ -319,6 +319,7 @@ CUSTOMIZE_DASHBOARD_COLUMNS = [
     "Employment Type",
     "Company Code",
     "Retention Applicable",
+    "Retention Remarks",
 ]
 
 CONSOLIDATED_PAYSHEET_COLUMNS = ["ERP", "First Hire Date", "Net Pay", "Monthly Gross"]
@@ -338,6 +339,41 @@ def _retention_clean_text(value) -> str:
 
 def _retention_normalise_key_series(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip().str.upper()
+
+
+def normalise_retention_employment_type(value) -> str:
+    """Return one of the three supported Retention Fund employment types.
+
+    Legacy saved values are migrated safely:
+      * Full Time -> Full Time
+      * Part Time / Gig / Gig Worker -> Gig Worker
+      * Contractual / Contractor / Consultant -> Consultant
+    Unknown or blank values default to Full Time for backward compatibility
+    with existing Customize Dashboard rows.
+    """
+    text = _retention_clean_text(value).lower()
+    if text in {"gig", "gig worker", "part time", "part-time", "parttime"}:
+        return "Gig Worker"
+    if text in {"consultant", "contractual", "contractor", "contract worker", "contract"}:
+        return "Consultant"
+    if text in {"full time", "full-time", "fulltime", "ft"}:
+        return "Full Time"
+    return "Full Time"
+
+
+def retention_applicable_from_employment_type(value) -> str:
+    """Employment Type is the first eligibility rule for Retention Fund."""
+    return "Yes" if normalise_retention_employment_type(value) == "Full Time" else "No"
+
+
+def retention_remark_from_employment_type(value) -> str:
+    """Human-readable rule remark derived only from Employment Type."""
+    employment_type = normalise_retention_employment_type(value)
+    if employment_type == "Full Time":
+        return "Retention Deduction Applicable - Full Time"
+    if employment_type == "Gig Worker":
+        return "No Deduction - Gig Worker"
+    return "No Deduction - Consultant"
 
 
 # --------------------------------------------------------------------------
@@ -392,6 +428,32 @@ def save_exceptional_erps(erps: list):
         json.dump(clean, f, indent=2)
 
 
+def sample_exceptional_erp_bulk_template() -> pd.DataFrame:
+    """One-column template for bulk exceptional ERP upload."""
+    return pd.DataFrame({"ERP": ["ERP00123", "ERP00456"]})
+
+
+def merge_exceptional_erp_bulk_upload(existing_erps: list, upload_df: pd.DataFrame, erp_col: str = "ERP") -> list:
+    """Merge exceptional ERPs from an uploaded sheet into the saved list.
+
+    Blank values are ignored and ERP matching is case-insensitive. The
+    returned list is deduplicated and upper-cased, matching save_exceptional_erps().
+    """
+    if upload_df is None or erp_col not in upload_df.columns:
+        raise ValueError("Exceptional ERP upload must contain an ERP column.")
+    uploaded = {
+        _retention_clean_text(v).upper()
+        for v in upload_df[erp_col].tolist()
+        if _retention_clean_text(v)
+    }
+    existing = {
+        _retention_clean_text(v).upper()
+        for v in (existing_erps or [])
+        if _retention_clean_text(v)
+    }
+    return sorted(existing | uploaded)
+
+
 # --------------------------------------------------------------------------
 # Customize Dashboard — Branch + Company Code + Designation rule table
 # --------------------------------------------------------------------------
@@ -409,17 +471,12 @@ def _prepare_customize_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     for col in ["Branch", "Designation", "Company Code"]:
         out[col] = out[col].apply(_retention_clean_text)
 
-    out["Employment Type"] = out["Employment Type"].apply(_retention_clean_text)
-    out["Retention Applicable"] = out["Retention Applicable"].apply(_retention_clean_text)
-
-    # New rows default to Full Time / Yes. Users can immediately change both
-    # fields through dropdowns in retention.py.
-    out.loc[out["Employment Type"].eq(""), "Employment Type"] = "Full Time"
-    out.loc[out["Retention Applicable"].eq(""), "Retention Applicable"] = "Yes"
-
-    # Invalid legacy values are kept safe rather than used as a deduction rule.
-    out.loc[~out["Employment Type"].isin(EMPLOYMENT_TYPE_OPTIONS), "Employment Type"] = "Full Time"
-    out.loc[~out["Retention Applicable"].isin(RETENTION_APPLICABLE_OPTIONS), "Retention Applicable"] = "No"
+    # Employment Type is the first retention-eligibility control.
+    # Retention Applicable and Retention Remarks are derived fields so users
+    # cannot accidentally set a Gig Worker / Consultant to Yes.
+    out["Employment Type"] = out["Employment Type"].apply(normalise_retention_employment_type)
+    out["Retention Applicable"] = out["Employment Type"].apply(retention_applicable_from_employment_type)
+    out["Retention Remarks"] = out["Employment Type"].apply(retention_remark_from_employment_type)
 
     # A match requires all three rule keys.
     valid = (
@@ -520,9 +577,10 @@ def merge_customize_dashboard_bulk_upload(
             {
                 "Branch": branch,
                 "Designation": designation,
-                "Employment Type": prior.get("Employment Type") or "Full Time",
+                "Employment Type": normalise_retention_employment_type(prior.get("Employment Type") or "Full Time"),
                 "Company Code": company_code,
-                "Retention Applicable": prior.get("Retention Applicable") or "Yes",
+                "Retention Applicable": retention_applicable_from_employment_type(prior.get("Employment Type") or "Full Time"),
+                "Retention Remarks": retention_remark_from_employment_type(prior.get("Employment Type") or "Full Time"),
             }
         )
 
@@ -761,6 +819,7 @@ def _attach_customize_rule(out: pd.DataFrame, customize_dashboard: pd.DataFrame 
     if rules.empty:
         result["Employment Type"] = None
         result["Retention Applicable"] = None
+        result["Retention Remarks"] = None
         result["Customize Rule Matched"] = False
         return result.drop(columns=["__branch_key", "__cc_key", "__designation_key"])
 
@@ -776,6 +835,7 @@ def _attach_customize_rule(out: pd.DataFrame, customize_dashboard: pd.DataFrame 
         "__designation_key",
         "Employment Type",
         "Retention Applicable",
+        "Retention Remarks",
         "Customize Rule Matched",
     ]
     result = result.merge(
@@ -904,6 +964,11 @@ def compute_paysheet_deduction(
             return "Employee Master Mapping Missing"
         if not row["Customize Rule Matched"]:
             return "Customize Rule Missing"
+        employment_type = normalise_retention_employment_type(row.get("Employment Type"))
+        if employment_type == "Gig Worker":
+            return "Gig Worker - No Deduction"
+        if employment_type == "Consultant":
+            return "Consultant - No Deduction"
         if str(row.get("Retention Applicable", "")).strip().lower() != "yes":
             return "Retention Not Applicable"
         if not row["Financial Data Valid"]:
@@ -912,7 +977,30 @@ def compute_paysheet_deduction(
             return "No Deduction"
         return "Pending Release"
 
+    def _final_retention_remark(row):
+        if not row["First Hire Date Valid"]:
+            return "No Deduction - Invalid First Hire Date"
+        if not row["Hired By This Month"]:
+            return "No Deduction - Before First Hire Month"
+        if row["Exceptional ERP"]:
+            return "No Deduction - Exceptional ERP"
+        if row["Employee Master Mapping Missing"]:
+            return "No Deduction - Employee Mapping Missing"
+        if not row["Customize Rule Matched"]:
+            return "No Deduction - Customize Rule Missing"
+        employment_type = normalise_retention_employment_type(row.get("Employment Type"))
+        if employment_type == "Gig Worker":
+            return "No Deduction - Gig Worker"
+        if employment_type == "Consultant":
+            return "No Deduction - Consultant"
+        if not row["Financial Data Valid"]:
+            return "No Deduction - Invalid Pay Data"
+        if row["Deduction Amount"] <= 0:
+            return "No Deduction - Zero Eligible Amount"
+        return "Retention Deducted - Full Time"
+
     out["Status"] = out.apply(_status, axis=1)
+    out["Final Retention Remark"] = out.apply(_final_retention_remark, axis=1)
     out["First Hire Month"] = out["First Hire Date"].dt.to_period("M").astype("string")
     return out
 
@@ -1054,6 +1142,8 @@ def consolidate_paysheet_months(monthly_results: list, erp_col: str = "ERP") -> 
             "Employment Type": ("Employment Type", "last"),
             "Company Code": ("Company Code", "last"),
             "Retention Applicable": ("Retention Applicable", "last"),
+            "Retention Remarks": ("Retention Remarks", "last"),
+            "Final Retention Remark": ("Final Retention Remark", "last"),
             "Months Processed": ("Paysheet Month", "nunique"),
             "Months With Deduction": ("Deduction Amount", lambda s: int((s > 0).sum())),
             "Total Deduction Accumulated": ("Deduction Amount", "sum"),
@@ -1107,6 +1197,7 @@ def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> di
         "Designation Summary": pd.DataFrame(),
         "Company Summary": pd.DataFrame(),
         "Employment Type Summary": pd.DataFrame(),
+        "Retention Remarks Summary": pd.DataFrame(),
         "Status Summary": pd.DataFrame(),
         "Pending Releases": pd.DataFrame(),
         "Exceptions - No Deduction": pd.DataFrame(),
@@ -1162,6 +1253,7 @@ def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> di
         "Designation Summary": _retention_group_report(work, "Designation"),
         "Company Summary": _retention_group_report(work, "Company Code"),
         "Employment Type Summary": _retention_group_report(work, "Employment Type"),
+        "Retention Remarks Summary": _retention_group_report(work, "Final Retention Remark"),
         "Status Summary": status_summary,
         "Pending Releases": pending,
         "Exceptions - No Deduction": exceptions,
