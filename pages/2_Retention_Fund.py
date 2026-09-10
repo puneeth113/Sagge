@@ -62,7 +62,6 @@ sample_customize_dashboard_bulk_template = _u.sample_customize_dashboard_bulk_te
 merge_customize_dashboard_bulk_upload = _u.merge_customize_dashboard_bulk_upload
 upsert_customize_dashboard_rule = _u.upsert_customize_dashboard_rule
 sample_consolidated_paysheet_template = _u.sample_consolidated_paysheet_template
-normalise_employee_master = _u.normalise_employee_master
 parse_wage_month_series = _u.parse_wage_month_series
 process_retention_paysheet = _u.process_retention_paysheet
 build_retention_reports = _u.build_retention_reports
@@ -73,9 +72,9 @@ render_top_nav("Retention Fund")
 
 st.title("💰 Retention Fund")
 st.caption(
-    "Upload one Retention Full Book with Wage Month on every row. The system reconstructs the first 3 "
-    "retention deductions from First Hire Date and Wage Month using min(10% of Monthly Gross, Net Pay), "
-    "then separates Release, Hold and Review cases using First Hire Date + the configured release days."
+    "Upload one Retention Full Book with Wage Month, Branch, Designation and Company Code on every row. "
+    "The system matches Branch + Company Code + Designation to the Customize Dashboard, reconstructs the "
+    "first 3 deductions using min(10% of Monthly Gross, Net Pay), then separates Release, Hold and Review cases."
 )
 
 with st.expander("🔒 Data handling on this page", expanded=False):
@@ -114,7 +113,11 @@ def auto_detect_column(df: pd.DataFrame, keywords: list):
 
 
 def standardize_retention_full_book(raw_df: pd.DataFrame, source_name: str) -> pd.DataFrame:
-    """Map common payroll headings to the five required retention fields."""
+    """Map common payroll headings to the required Retention Full Book fields.
+
+    Branch + Company Code + Designation are mandatory because these three
+    values are the key used to match the Customize Dashboard eligibility rule.
+    """
     mapping = {
         "ERP": auto_detect_column(raw_df, ["erp", "employee id", "employee code", "emp code", "erp code"]),
         "First Hire Date": auto_detect_column(
@@ -123,7 +126,19 @@ def standardize_retention_full_book(raw_df: pd.DataFrame, source_name: str) -> p
         ),
         "Wage Month": auto_detect_column(
             raw_df,
-            ["wage month", "wage_month", "salary month", "pay month", "payroll month", "month"],
+            ["wage month", "wage_month", "salary month", "pay month", "payroll month"],
+        ),
+        "Branch": auto_detect_column(
+            raw_df,
+            ["branch", "current branch", "curr.branch", "curr branch", "branch name", "location"],
+        ),
+        "Designation": auto_detect_column(
+            raw_df,
+            ["designation", "current designation", "curr.designation", "curr designation", "role", "job title", "position"],
+        ),
+        "Company Code": auto_detect_column(
+            raw_df,
+            ["company code", "companycode", "comp code", "company_code", "entity code", "company"],
         ),
         "Net Pay": auto_detect_column(raw_df, ["net pay", "net salary", "in-hand", "inhand"]),
         "Monthly Gross": auto_detect_column(raw_df, ["monthly gross", "gross pay", "gross salary", "gross"]),
@@ -132,23 +147,18 @@ def standardize_retention_full_book(raw_df: pd.DataFrame, source_name: str) -> p
     if missing:
         raise ValueError(
             f"{source_name} is missing required column(s): {', '.join(missing)}. "
-            "Required format: ERP, First Hire Date, Wage Month, Net Pay, Monthly Gross."
+            "Required format: ERP, First Hire Date, Wage Month, Branch, Designation, "
+            "Company Code, Net Pay, Monthly Gross."
         )
-    # Prevent one source column from accidentally satisfying two target fields.
     used = [mapping[c] for c in CONSOLIDATED_PAYSHEET_COLUMNS]
     if len(set(used)) != len(used):
         raise ValueError(
             "Some required fields were mapped to the same source column. Please use clear headings: "
-            "ERP, First Hire Date, Wage Month, Net Pay and Monthly Gross."
+            "ERP, First Hire Date, Wage Month, Branch, Designation, Company Code, Net Pay and Monthly Gross."
         )
     out = raw_df[used].copy()
     out.columns = CONSOLIDATED_PAYSHEET_COLUMNS
     return out
-
-
-def _employee_master_from_session():
-    employee_db = st.session_state.get("employee_db")
-    return employee_db if isinstance(employee_db, pd.DataFrame) else pd.DataFrame()
 
 
 def _download_report_pack(reports: dict, key: str, label: str = "⬇️ Download Complete Retention Report"):
@@ -196,28 +206,20 @@ tab_compute, tab_customize, tab_dashboard = st.tabs(
 with tab_compute:
     st.markdown("### Retention Full Book Compute")
     st.caption(
-        "One file can contain many employees and many Wage Months. The system checks each ERP against "
-        "First Hire Date, Customize eligibility and hard exclusions, then reconstructs the first, second "
-        "and final retention deductions."
+        "One file can contain many employees and many Wage Months. Branch + Company Code + Designation "
+        "from each paysheet row are matched directly to the Customize Dashboard, then the system checks "
+        "First Hire Date and hard exclusions before reconstructing the first, second and final deductions."
     )
 
-    employee_master_raw = _employee_master_from_session()
-    employee_master = normalise_employee_master(employee_master_raw)
     customize_rules = load_customize_dashboard()
     ignored_company_codes = load_ignored_company_codes()
     exceptional_erps = load_exceptional_erps()
 
-    ready1, ready2, ready3, ready4 = st.columns(4)
-    ready1.metric("Employee Mappings", len(employee_master))
-    ready2.metric("Customize Rules", len(customize_rules))
-    ready3.metric("Excluded Company Codes", len(ignored_company_codes))
-    ready4.metric("Exceptional ERPs", len(exceptional_erps))
+    ready1, ready2, ready3 = st.columns(3)
+    ready1.metric("Customize Rules", len(customize_rules))
+    ready2.metric("Excluded Company Codes", len(ignored_company_codes))
+    ready3.metric("Exceptional ERPs", len(exceptional_erps))
 
-    if employee_master.empty:
-        st.warning(
-            "Employee Database mapping is unavailable or incomplete. Rows without ERP → Branch / Designation / "
-            "Company Code mapping will be marked as no deduction for safety."
-        )
     if customize_rules.empty:
         st.warning(
             "No Customize Dashboard rules are configured. Configure eligibility before computing the Retention Full Book."
@@ -248,13 +250,14 @@ with tab_compute:
 
     st.markdown("#### 2. Upload Single Retention Full Book")
     st.caption(
-        "Required columns: **ERP | First Hire Date | Wage Month | Net Pay | Monthly Gross**. "
-        "Wage Month may vary row by row. Upload one consolidated full book instead of separate monthly files."
+        "Required columns: **ERP | First Hire Date | Wage Month | Branch | Designation | Company Code | "
+        "Net Pay | Monthly Gross**. Wage Month may vary row by row. Branch + Company Code + Designation are "
+        "used directly to find the employee's eligibility rule in the Customize Dashboard."
     )
     st.info(
         "For old joiners, keep the historical Wage Month rows for their first 3 employment months in this file. "
-        "Because the paysheet does not contain a separate historical Retention Deduction column, the system "
-        "reconstructs the deduction count from those rows using the retention formula."
+        "Each row must carry Branch, Designation and Company Code. The system matches those three values to the "
+        "Customize Dashboard and reconstructs the deduction count using the retention formula."
     )
     sample = sample_consolidated_paysheet_template()
     with st.expander("View sample format", expanded=False):
@@ -292,6 +295,20 @@ with tab_compute:
                 valid_months.max().strftime("%b-%Y") if not valid_months.empty else "Invalid / Missing",
             )
 
+            profile_blank = (
+                standardized_book[["Branch", "Designation", "Company Code"]]
+                .fillna("").astype(str).apply(lambda c: c.str.strip()).eq("").any(axis=1)
+            )
+            unique_rule_keys = standardized_book[["Branch", "Company Code", "Designation"]].drop_duplicates()
+            q1, q2 = st.columns(2)
+            q1.metric("Unique Branch / Company / Designation Keys", len(unique_rule_keys))
+            q2.metric("Rows Missing Rule-Key Data", int(profile_blank.sum()))
+            if profile_blank.any():
+                st.warning(
+                    "Some paysheet rows are missing Branch, Designation or Company Code. Those rows will not be "
+                    "eligible for deduction until all three values are present."
+                )
+
             with st.expander("Preview standardized full book", expanded=False):
                 st.dataframe(standardized_book.head(100), use_container_width=True, hide_index=True)
         except Exception as exc:
@@ -308,7 +325,7 @@ with tab_compute:
                     standardized_book,
                     exceptional_erps=exceptional_erps,
                     customize_dashboard=customize_rules,
-                    employee_master=employee_master_raw,
+                    employee_master=None,
                     ignored_company_codes=ignored_company_codes,
                     release_days=int(release_days),
                     release_review_date=release_review_date,
