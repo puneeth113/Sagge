@@ -170,16 +170,22 @@ def _employee_master_from_session():
     return pd.DataFrame()
 
 
-def _download_report_pack(reports: dict):
+def _download_report_pack(reports: dict, key: str, label: str = "⬇️ Download Complete Retention Report"):
+    """Render a complete report download button with a caller-supplied unique Streamlit key.
+
+    The same report pack is shown in more than one tab. Streamlit executes all tab
+    blocks on each rerun, so each rendered widget must have its own key even when
+    the buttons are on different tabs.
+    """
     nonempty = {name: df for name, df in reports.items() if isinstance(df, pd.DataFrame) and not df.empty}
     if not nonempty:
         return
     st.download_button(
-        "⬇️ Download Complete Retention Report",
+        label,
         data=to_excel_bytes(nonempty),
         file_name=f"retention_fund_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_complete_retention_report",
+        key=key,
     )
 
 
@@ -388,7 +394,7 @@ with tab_compute:
         m4.metric("Hire-Date Audit Flags", audit_employees)
 
         st.dataframe(summary, use_container_width=True, height=420)
-        _download_report_pack(reports)
+        _download_report_pack(reports, key="download_complete_retention_report_compute")
 
         pending_df = reports.get("Pending Releases", pd.DataFrame())
         if isinstance(pending_df, pd.DataFrame) and not pending_df.empty:
@@ -659,4 +665,4 @@ with tab_dashboard:
                     st.info(f"No data available for {report_name}.")
 
         st.markdown("#### Download Reports")
-        _download_report_pack(reports)
+        _download_report_pack(reports, key="download_complete_retention_report_analytics")
