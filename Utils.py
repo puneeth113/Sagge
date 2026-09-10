@@ -319,12 +319,18 @@ CUSTOMIZE_DASHBOARD_COLUMNS = [
     "Retention Applicable",
 ]
 
-# Public name retained for compatibility. The new full-book format includes
-# Wage Month because the payroll month varies row by row inside one file.
+# Retention Full Book columns. Branch / Designation / Company Code are now
+# carried directly in the paysheet so the compute engine can match every row
+# to the Customize Dashboard without depending on the Employee Database page.
+# The old helper wrappers can still back-fill these three fields from an
+# employee master when an older caller does not provide them.
 CONSOLIDATED_PAYSHEET_COLUMNS = [
     "ERP",
     "First Hire Date",
     "Wage Month",
+    "Branch",
+    "Designation",
+    "Company Code",
     "Net Pay",
     "Monthly Gross",
 ]
@@ -725,12 +731,17 @@ def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.S
 # --------------------------------------------------------------------------
 
 def sample_consolidated_paysheet_template() -> pd.DataFrame:
-    """Sample of the new single-file full-book format."""
+    """Sample of the single-file Retention Full Book format.
+
+    Branch, Designation and Company Code are intentionally part of the
+    paysheet. They form the exact key used to look up the employee's rule in
+    the Customize Dashboard: Branch + Company Code + Designation.
+    """
     return pd.DataFrame([
-        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-07", "Net Pay": 21000, "Monthly Gross": 25000},
-        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-08", "Net Pay": 21500, "Monthly Gross": 25000},
-        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-09", "Net Pay": 22000, "Monthly Gross": 25000},
-        {"ERP": "E002", "First Hire Date": "2026-09-05", "Wage Month": "2026-09", "Net Pay": 900, "Monthly Gross": 15000},
+        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-07", "Branch": "Koramangala", "Designation": "Teacher", "Company Code": "MAIN", "Net Pay": 21000, "Monthly Gross": 25000},
+        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-08", "Branch": "Koramangala", "Designation": "Teacher", "Company Code": "MAIN", "Net Pay": 21500, "Monthly Gross": 25000},
+        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-09", "Branch": "Koramangala", "Designation": "Teacher", "Company Code": "MAIN", "Net Pay": 22000, "Monthly Gross": 25000},
+        {"ERP": "E002", "First Hire Date": "2026-09-05", "Wage Month": "2026-09", "Branch": "Whitefield", "Designation": "Principal", "Company Code": "MAIN", "Net Pay": 900, "Monthly Gross": 15000},
     ])
 
 
@@ -853,9 +864,11 @@ def _attach_employee_profile(paysheet: pd.DataFrame, erp_col: str, employee_mast
             blank = out[col].eq("")
             out.loc[blank, col] = mapped.loc[blank].fillna("")
 
-    out["Employee Master Mapping Missing"] = (
+    out["Paysheet Rule Key Missing"] = (
         out["Branch"].eq("") | out["Designation"].eq("") | out["Company Code"].eq("")
     )
+    # Legacy alias retained so older reports/imports do not break.
+    out["Employee Master Mapping Missing"] = out["Paysheet Rule Key Missing"]
     return out
 
 
@@ -911,8 +924,8 @@ def _deduction_stage_from_index(month_index):
 
 def _retention_exclusion_reason(row) -> str:
     """Return the first business-rule reason that blocks retention eligibility."""
-    if row.get("Employee Master Mapping Missing", False):
-        return "Employee Master Mapping Missing"
+    if row.get("Paysheet Rule Key Missing", row.get("Employee Master Mapping Missing", False)):
+        return "Paysheet Rule Key Missing"
     if row.get("Company Code Excluded", False):
         return "Excluded Company Code"
     if row.get("Exceptional ERP", False):
@@ -943,7 +956,12 @@ def process_retention_paysheet(
     """Process one retention full book and return (ERP summary, row detail).
 
     Required source columns after standardization:
-      ERP, First Hire Date, Wage Month, Net Pay, Monthly Gross
+      ERP, First Hire Date, Wage Month, Branch, Designation, Company Code,
+      Net Pay, Monthly Gross
+
+    Branch + Company Code + Designation are matched directly against the
+    Customize Dashboard rule table. Employee-master enrichment is retained
+    only as a backward-compatible fallback for older callers.
 
     The source may contain many Wage Months and many rows per ERP, but only one
     row per ERP + Wage Month is allowed. The earliest valid First Hire Date in
@@ -1071,8 +1089,8 @@ def process_retention_paysheet(
             return "Excluded Company Code - No Deduction"
         if row["Exceptional ERP"]:
             return "Exceptional ERP - No Deduction"
-        if row["Employee Master Mapping Missing"]:
-            return "Employee Master Mapping Missing"
+        if row.get("Paysheet Rule Key Missing", row.get("Employee Master Mapping Missing", False)):
+            return "Paysheet Rule Key Missing"
         if not row["Customize Rule Matched"]:
             return "Customize Rule Missing"
         if normalise_retention_employment_type(row.get("Employment Type")) != "Full Time":
@@ -1307,6 +1325,11 @@ def compute_paysheet_deduction(
         gross_col: "Monthly Gross",
     })
     work["Wage Month"] = pd.Timestamp(paysheet_month).to_period("M").to_timestamp()
+    # Older monthly callers may not carry the rule-key columns. Add blanks and
+    # let the existing employee_master fallback fill them when available.
+    for profile_col in ["Branch", "Designation", "Company Code"]:
+        if profile_col not in work.columns:
+            work[profile_col] = ""
     _, detail = process_retention_paysheet(
         work[CONSOLIDATED_PAYSHEET_COLUMNS],
         exceptional_erps=exceptional_erps,
@@ -1350,6 +1373,9 @@ def process_consolidated_paysheets(
         if missing:
             raise ValueError(f"{source or 'Paysheet'} is missing required column(s): {', '.join(missing)}")
         work["Wage Month"] = pd.Timestamp(month).to_period("M").to_timestamp()
+        for profile_col in ["Branch", "Designation", "Company Code"]:
+            if profile_col not in work.columns:
+                work[profile_col] = ""
         rows.append(work[CONSOLIDATED_PAYSHEET_COLUMNS])
     if not rows:
         return pd.DataFrame(), pd.DataFrame()
@@ -1457,7 +1483,8 @@ def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> di
         "Exceptional ERP - No Deduction",
         "Non-Full Time - No Deduction",
         "Retention Not Applicable - No Deduction",
-        "Employee Master Mapping Missing",
+        "Paysheet Rule Key Missing",
+        "Employee Master Mapping Missing",  # legacy status from older cached runs
         "Customize Rule Missing",
     ]
     exclusion_summary = (
@@ -1476,7 +1503,9 @@ def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> di
     new_joiners = work.loc[work["New Joiner in Current Payroll"]].copy()
     eligible_new_joiners = new_joiners.loc[new_joiners["Retention Eligible"]].copy() if not new_joiners.empty else pd.DataFrame()
     deduction_history = work.loc[work["Deduction Occurred"]].copy()
-    missing_mapping = work.loc[work["Status"].isin(["Employee Master Mapping Missing", "Customize Rule Missing"])].copy()
+    missing_mapping = work.loc[work["Status"].isin([
+        "Paysheet Rule Key Missing", "Employee Master Mapping Missing", "Customize Rule Missing"
+    ])].copy()
     first_hire_audit = work.loc[
         work["First Hire Date Variance"].fillna(False)
         | work["First Hire Date Recovered"].fillna(False)
