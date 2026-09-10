@@ -3,12 +3,15 @@ import importlib.util
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
+
 # NOTE: this single file replaces the previous
 # pages/2_Retention_Fund_Tracker.py and pages/2a_Retention_Dashboard.py.
-# Rename this file to pages/2_Retention_Fund.py so page numbering/ordering
-# in the sidebar stays consistent, and update Home.py's nav link to match
-# (see the Home.py update provided alongside this file).
+# Internal Transfer handling has been removed entirely — the Customize
+# Dashboard tab is now the single place Branch / Company Code / Designation
+# / Employment Type / Retention Applicable live for each ERP, and retention
+# fund deduction is computed straight off each employee's First Hire Date
+# rather than a Joining-Date-in-cycle check.
 
 
 def _load_utils():
@@ -42,36 +45,44 @@ download_button_for_df = _u.download_button_for_df
 to_excel_bytes = _u.to_excel_bytes
 safe_error_message = _u.safe_error_message
 render_clear_data_button = _u.render_clear_data_button
-sample_employee_master_for_retention = _u.sample_employee_master_for_retention
-compute_retention_fund_deduction = _u.compute_retention_fund_deduction
-categorize_retention_status = _u.categorize_retention_status
-filter_by_company_code = _u.filter_by_company_code
-filter_by_branch = _u.filter_by_branch
-generate_retention_report = _u.generate_retention_report
-load_ignored_company_codes = _u.load_ignored_company_codes
-save_ignored_company_codes = _u.save_ignored_company_codes
-sample_erp_transfer_template = _u.sample_erp_transfer_template
-apply_internal_transfers = _u.apply_internal_transfers
-get_payroll_cycle = _u.get_payroll_cycle
-tag_new_joiners = _u.tag_new_joiners
 format_date_ddmmmyyyy = _u.format_date_ddmmmyyyy
 pending_deduction_sentence = _u.pending_deduction_sentence
+
+load_ignored_company_codes = _u.load_ignored_company_codes
+save_ignored_company_codes = _u.save_ignored_company_codes
+load_exceptional_erps = _u.load_exceptional_erps
+save_exceptional_erps = _u.save_exceptional_erps
+
+EMPLOYMENT_TYPE_OPTIONS = _u.EMPLOYMENT_TYPE_OPTIONS
+RETENTION_APPLICABLE_OPTIONS = _u.RETENTION_APPLICABLE_OPTIONS
+CUSTOMIZE_DASHBOARD_COLUMNS = _u.CUSTOMIZE_DASHBOARD_COLUMNS
+load_customize_dashboard = _u.load_customize_dashboard
+save_customize_dashboard = _u.save_customize_dashboard
+sample_customize_dashboard_bulk_template = _u.sample_customize_dashboard_bulk_template
+merge_customize_dashboard_bulk_upload = _u.merge_customize_dashboard_bulk_upload
+
+CONSOLIDATED_PAYSHEET_COLUMNS = _u.CONSOLIDATED_PAYSHEET_COLUMNS
+sample_consolidated_paysheet_template = _u.sample_consolidated_paysheet_template
+compute_paysheet_deduction = _u.compute_paysheet_deduction
+consolidate_paysheet_months = _u.consolidate_paysheet_months
 
 st.set_page_config(page_title="Retention Fund", page_icon="💰", layout="wide")
 render_top_nav("Retention Fund")
 
 st.title("💰 Retention Fund")
 st.caption(
-    "Track employee retention fund deductions by company code and branch, and view "
-    "statistical analysis and KPI tracking — all in one place."
+    "Track employee retention fund deductions from consolidated monthly paysheets, based on each "
+    "employee's First Hire Date — with per-employee Branch / Designation / Employment Type / "
+    "Retention Applicable settings managed centrally in the Customize Dashboard."
 )
 
 with st.expander("🔒 Data handling on this page", expanded=False):
     st.markdown(
         "- Uploaded files are processed **only in memory** for this browser session — nothing is written "
-        "to disk, logged, or sent to any external service.\n"
+        "to disk, logged, or sent to any external service (except your saved Customize Dashboard / "
+        "Exceptional ERP / Ignored Company Code settings, which are small admin config files).\n"
         "- Downloaded reports are automatically sanitized against Excel/CSV formula-injection payloads.\n"
-        "- Use the button below to explicitly wipe all cached data from this session once you're done."
+        "- Use the button below to explicitly wipe all cached paysheet data from this session once you're done."
     )
     render_clear_data_button()
 
@@ -96,519 +107,443 @@ def auto_detect_column(df: pd.DataFrame, keywords: list) -> str:
     return df.columns[0] if len(df.columns) > 0 else None
 
 
-def calculate_expected_release_date(joining_date, min_tenure_months=12):
-    """Calculate expected release date based on joining date and minimum tenure.
-
-    Args:
-        joining_date: Employee joining date
-        min_tenure_months: Minimum tenure in months before release
-
-    Returns:
-        Expected release date
-    """
-    try:
-        if pd.isna(joining_date):
-            return None
-
-        # Convert to datetime if string
-        if isinstance(joining_date, str):
-            joining_dt = pd.to_datetime(joining_date)
-        else:
-            joining_dt = joining_date
-
-        # Add minimum tenure months
-        release_date = joining_dt + pd.DateOffset(months=min_tenure_months)
-        return release_date
-    except:
-        return None
-
-
-def count_deductions_by_status(df: pd.DataFrame) -> dict:
-    """Count completed and pending deductions.
-
-    Args:
-        df: Result DataFrame with deduction data
-
-    Returns:
-        Dictionary with deduction counts
-    """
-    if "Status" not in df.columns:
-        return {"Completed": 0, "Pending": 0}
-
-    pending = (df["Status"] == "Pending Release").sum()
-    completed = (df["Status"] == "No Deduction").sum()
-
-    return {
-        "Pending": pending,
-        "Completed": completed,
-        "Total": len(df)
-    }
+# ================================================================
+# SUB-NAVIGATION: Compute | Customize Dashboard | Analytics Dashboard
+# ================================================================
+tab_compute, tab_customize, tab_dashboard = st.tabs(
+    ["💰 Retention Fund Compute", "🛠️ Customize Dashboard", "📊 Analytics Dashboard"]
+)
 
 
 # ================================================================
-# SUB-NAVIGATION: Tracker | Dashboard
+# TAB 1: COMPUTE (Exceptional ERPs + Consolidated Paysheet upload + calc)
 # ================================================================
-tab_tracker, tab_dashboard = st.tabs(["💰 Retention Fund Tracker", "📊 Retention Fund Dashboard"])
-
-
-# ================================================================
-# TAB 1: RETENTION FUND TRACKER (computation)
-# ================================================================
-with tab_tracker:
-    # ------------------------------------------------------------
-    # Horizontal step indicator
-    # ------------------------------------------------------------
+with tab_compute:
     step_col1, step_col2, step_col3 = st.columns(3)
-    step_col1.markdown("**① Upload Employee Data**")
-    step_col2.markdown("**② Internal Transfers**")
-    step_col3.markdown("**③ Configure & Calculate**")
+    step_col1.markdown("**① Exceptional ERP Cases**")
+    step_col2.markdown("**② Consolidated Paysheet Upload**")
+    step_col3.markdown("**③ Calculate & Report**")
     st.divider()
 
     # ------------------------------------------------------------
-    # STEP 1: Upload Employee Master Data
+    # STEP 1: Exceptional ERP Cases
     # ------------------------------------------------------------
-    st.markdown("### Step 1: Upload Employee Master Data")
+    st.markdown("### Step 1: Exceptional ERP Cases")
     st.caption(
-        "Columns required: **ERP, Name, Joining Date, Company Code, Branch, Gross Salary**. "
-        "**Joining Date is mandatory** — it drives both New Joiner tagging and the expected release date."
+        "ERPs listed here will **never** have a retention fund deduction applied, no matter what "
+        "Company Code or Retention Applicable is set to in the Customize Dashboard. Use this for "
+        "one-off exceptions (e.g. a settlement, a special contract)."
     )
 
-    sample = sample_employee_master_for_retention()
-    st.dataframe(sample, use_container_width=True)
-    st.download_button(
-        "⬇️ Download sample template",
-        data=to_excel_bytes({"Template": sample}),
-        file_name="retention_fund_template.xlsx",
-        key="dl_retention_template",
-    )
+    with st.expander("Manage exceptional ERPs", expanded=False):
+        exceptional_erps = load_exceptional_erps()
 
-    uploaded = st.file_uploader(
-        "Upload Employee Master Data (.xlsx or .csv)",
-        type=["xlsx", "xls", "csv"],
-        key="retention_master",
-    )
+        if exceptional_erps:
+            for i, erp in enumerate(exceptional_erps):
+                c1, c2 = st.columns([5, 1])
+                c1.write(f"• `{erp}`")
+                if c2.button("Remove", key=f"remove_exceptional_erp_{i}"):
+                    save_exceptional_erps([e for e in exceptional_erps if e != erp])
+                    st.rerun()
+        else:
+            st.info("No exceptional ERPs currently configured.")
 
-    if uploaded:
-        df = read_any_table(uploaded)
-        st.session_state["retention_fund_data"] = df
-        st.success(f"Loaded {len(df)} employees.")
-
-    if "retention_fund_data" in st.session_state and not st.session_state["retention_fund_data"].empty:
-        df = st.session_state["retention_fund_data"]
-
-        # Auto-detect columns
-        erp_col = auto_detect_column(df, ["erp", "emp id", "employee id"])
-        name_col = auto_detect_column(df, ["name", "employee name"])
-        cc_col = auto_detect_column(df, ["cc", "company code", "company"])
-        branch_col = auto_detect_column(df, ["branch"])
-        salary_col = auto_detect_column(df, ["gross", "salary", "earned"])
-        joining_col = auto_detect_column(df, ["joining", "doj", "date of joining"])
-
-        # Verify all columns were detected
-        missing_cols = []
-        if not erp_col:
-            missing_cols.append("ERP ID")
-        if not name_col:
-            missing_cols.append("Name")
-        if not cc_col:
-            missing_cols.append("Company Code")
-        if not branch_col:
-            missing_cols.append("Branch")
-        if not salary_col:
-            missing_cols.append("Gross Salary")
-        if not joining_col:
-            missing_cols.append("Joining Date (Mandatory)")
-
-        if missing_cols:
-            st.error(f"❌ Missing required columns: {', '.join(missing_cols)}")
-            st.stop()
-
-        # Display auto-detected columns
-        st.markdown("#### Auto-Detected Columns")
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        col1.info(f"📌 ERP ID:\n`{erp_col}`")
-        col2.info(f"📌 Name:\n`{name_col}`")
-        col3.info(f"📌 CC:\n`{cc_col}`")
-        col4.info(f"📌 Branch:\n`{branch_col}`")
-        col5.info(f"📌 Gross Salary:\n`{salary_col}`")
-        col6.warning(f"📌 DOJ:\n`{joining_col}`\n(Mandatory)")
-
-        st.divider()
-
-        # ------------------------------------------------------------
-        # STEP 2: Internal Transfers (ERP change on branch/company transfer)
-        # ------------------------------------------------------------
-        st.markdown("### Step 2: Internal Transfers (Branch/Company Change with New ERP)")
-        st.caption(
-            "If an employee moved branches (and/or company code) and was issued a **new ERP**, "
-            "upload the Old ERP → New ERP mapping here. It's applied automatically to the "
-            "Employee Master Data from Step 1 — before deduction is computed — so any deduction "
-            "still pending release follows the employee to their new ERP."
-        )
-
-        transfer_sample = sample_erp_transfer_template()
-        st.dataframe(transfer_sample, use_container_width=True)
-        st.download_button(
-            "⬇️ Download transfer mapping template",
-            data=to_excel_bytes({"Template": transfer_sample}),
-            file_name="internal_transfer_template.xlsx",
-            key="dl_transfer_template",
-        )
-
-        transfer_file = st.file_uploader(
-            "Upload Internal Transfer Mapping (.xlsx or .csv) — optional",
-            type=["xlsx", "xls", "csv"],
-            key="internal_transfer_upload",
-        )
-
-        if transfer_file:
-            st.session_state["internal_transfers"] = read_any_table(transfer_file)
-            st.success(f"Loaded {len(st.session_state['internal_transfers'])} transfer record(s).")
-
-        if "internal_transfers" in st.session_state and not st.session_state["internal_transfers"].empty:
-            transfers_df = st.session_state["internal_transfers"]
-
-            with st.expander(f"Preview: {len(transfers_df)} transfer record(s) loaded", expanded=False):
-                st.dataframe(transfers_df, use_container_width=True)
-            if st.button("Clear loaded transfer mapping", key="clear_transfers"):
-                del st.session_state["internal_transfers"]
+        add_col1, add_col2 = st.columns([4, 1])
+        new_erp = add_col1.text_input("Add an ERP to exclude", key="new_exceptional_erp_input")
+        if add_col2.button("Add", key="add_exceptional_erp_btn"):
+            new_erp_clean = new_erp.strip().upper()
+            if not new_erp_clean:
+                st.warning("Enter an ERP first.")
+            elif new_erp_clean in exceptional_erps:
+                st.warning(f"'{new_erp_clean}' is already excluded.")
+            else:
+                save_exceptional_erps(exceptional_erps + [new_erp_clean])
+                st.success(f"Added '{new_erp_clean}' to the exceptional ERP list.")
                 st.rerun()
 
-            old_erp_t_col = auto_detect_column(transfers_df, ["old erp"])
-            new_erp_t_col = auto_detect_column(transfers_df, ["new erp"])
-            new_branch_t_col = auto_detect_column(transfers_df, ["new branch"])
-            new_cc_t_col = auto_detect_column(transfers_df, ["new company", "new cc"])
+    current_exceptional = load_exceptional_erps()
+    st.caption(
+        f"Exceptional ERPs currently excluded: **{', '.join(current_exceptional) if current_exceptional else 'None'}**"
+    )
 
-            try:
-                df = apply_internal_transfers(
-                    df,
-                    transfers_df,
-                    erp_col=erp_col,
-                    old_erp_col=old_erp_t_col,
-                    new_erp_col=new_erp_t_col,
-                    branch_col=branch_col,
-                    new_branch_col=new_branch_t_col,
-                    cc_col=cc_col,
-                    new_cc_col=new_cc_t_col,
+    st.divider()
+
+    # ------------------------------------------------------------
+    # STEP 2: Consolidated Paysheet Upload (one file per month)
+    # ------------------------------------------------------------
+    st.markdown("### Step 2: Consolidated Paysheet Upload")
+    st.caption(
+        "Upload one paysheet file **per month**. Required columns: **ERP, First Hire Date, Net Pay, "
+        "Monthly Gross**. Retention fund deduction for that month = **min(10% of Monthly Gross, Net Pay)**, "
+        "and is only computed from the month of the employee's First Hire Date onward."
+    )
+
+    paysheet_sample = sample_consolidated_paysheet_template()
+    st.dataframe(paysheet_sample, use_container_width=True)
+    st.download_button(
+        "⬇️ Download sample paysheet template",
+        data=to_excel_bytes({"Template": paysheet_sample}),
+        file_name="consolidated_paysheet_template.xlsx",
+        key="dl_paysheet_template",
+    )
+
+    if "consolidated_paysheets" not in st.session_state:
+        st.session_state["consolidated_paysheets"] = []  # list of {"month": Timestamp, "df": DataFrame}
+
+    up_col1, up_col2 = st.columns([2, 3])
+    with up_col1:
+        paysheet_month_input = st.date_input(
+            "Payroll month for this file",
+            value=date.today().replace(day=1),
+            key="paysheet_month_input",
+            help="Pick any date inside the month this paysheet covers — only the month/year is used.",
+        )
+    with up_col2:
+        paysheet_file = st.file_uploader(
+            "Upload this month's paysheet (.xlsx or .csv)",
+            type=["xlsx", "xls", "csv"],
+            key="paysheet_file_uploader",
+        )
+
+    if st.button("➕ Add this month to the batch", key="add_paysheet_month_btn"):
+        if paysheet_file is None:
+            st.warning("Choose a file to upload first.")
+        else:
+            raw_df = read_any_table(paysheet_file)
+            month_ts = pd.Timestamp(paysheet_month_input).to_period("M").to_timestamp()
+            already = [
+                m for m in st.session_state["consolidated_paysheets"]
+                if m["month"] == month_ts
+            ]
+            if already:
+                st.warning(
+                    f"A paysheet for {month_ts.strftime('%b-%Y')} is already in the batch. "
+                    "Remove it below first if you want to replace it."
                 )
-                st.session_state["retention_fund_data"] = df
+            else:
+                st.session_state["consolidated_paysheets"].append({"month": month_ts, "df": raw_df})
+                st.success(f"Added {month_ts.strftime('%b-%Y')} paysheet ({len(raw_df)} rows) to the batch.")
+                st.rerun()
 
-                if "Transferred" in df.columns and df["Transferred"].any():
-                    st.info(
-                        f"🔁 Internal transfer mapping applied — "
-                        f"{int(df['Transferred'].sum())} employee(s) moved to their new ERP."
+    if st.session_state["consolidated_paysheets"]:
+        st.markdown("#### Months in this batch")
+        for i, entry in enumerate(sorted(st.session_state["consolidated_paysheets"], key=lambda e: e["month"])):
+            c1, c2, c3 = st.columns([2, 2, 1])
+            c1.write(f"**{entry['month'].strftime('%b-%Y')}**")
+            c2.write(f"{len(entry['df'])} rows")
+            if c3.button("Remove", key=f"remove_paysheet_month_{i}"):
+                st.session_state["consolidated_paysheets"] = [
+                    e for e in st.session_state["consolidated_paysheets"] if e["month"] != entry["month"]
+                ]
+                st.rerun()
+    else:
+        st.info("No paysheet months added yet.")
+
+    st.divider()
+
+    # ------------------------------------------------------------
+    # STEP 3: Calculate
+    # ------------------------------------------------------------
+    st.markdown("### Step 3: Calculate & Report")
+
+    deduction_pct = st.number_input(
+        "Deduction Percentage Cap (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=10.0,
+        key="deduction_pct",
+        help="Deduction each month = min(this % of Monthly Gross, that month's Net Pay).",
+    )
+
+    if st.button("Calculate Consolidated Retention Fund", key="calc_retention", type="primary"):
+        if not st.session_state["consolidated_paysheets"]:
+            st.warning("Add at least one month's paysheet before calculating.")
+        else:
+            try:
+                customize_df = load_customize_dashboard()
+                exceptional_erps = load_exceptional_erps()
+
+                monthly_results = []
+                for entry in st.session_state["consolidated_paysheets"]:
+                    raw_df = entry["df"]
+                    month_ts = entry["month"]
+
+                    erp_col = auto_detect_column(raw_df, ["erp", "emp id", "employee id"])
+                    first_hire_col = auto_detect_column(raw_df, ["first hire", "hire date", "doj", "joining"])
+                    net_pay_col = auto_detect_column(raw_df, ["net pay", "net salary", "in-hand", "inhand"])
+                    gross_col = auto_detect_column(raw_df, ["monthly gross", "gross"])
+
+                    missing = []
+                    if not erp_col:
+                        missing.append("ERP")
+                    if not first_hire_col:
+                        missing.append("First Hire Date")
+                    if not net_pay_col:
+                        missing.append("Net Pay")
+                    if not gross_col:
+                        missing.append("Monthly Gross")
+                    if missing:
+                        st.error(
+                            f"❌ {month_ts.strftime('%b-%Y')} paysheet is missing required column(s): "
+                            f"{', '.join(missing)}"
+                        )
+                        st.stop()
+
+                    month_result = compute_paysheet_deduction(
+                        raw_df,
+                        erp_col=erp_col,
+                        first_hire_col=first_hire_col,
+                        net_pay_col=net_pay_col,
+                        gross_col=gross_col,
+                        paysheet_month=month_ts,
+                        exceptional_erps=exceptional_erps,
+                        customize_dashboard=customize_df,
+                        deduction_pct=deduction_pct,
                     )
-                    with st.expander("View transferred employees", expanded=False):
-                        preview_cols = [c for c in ["Previous ERP", erp_col, name_col, branch_col, cc_col] if c in df.columns]
-                        st.dataframe(df[df["Transferred"] == True][preview_cols], use_container_width=True)
+                    month_result = month_result.rename(columns={erp_col: "ERP"})
+                    monthly_results.append(month_result)
+
+                summary, combined = consolidate_paysheet_months(monthly_results, erp_col="ERP")
+
+                st.session_state["consolidated_paysheet_summary"] = summary
+                st.session_state["consolidated_paysheet_result"] = combined
+                st.success(
+                    f"✅ Consolidated retention fund calculated across "
+                    f"{len(st.session_state['consolidated_paysheets'])} month(s) and {summary['ERP'].nunique()} employee(s)."
+                )
             except Exception as e:
-                _show_error(e, "applying internal transfers")
+                _show_error(e, "calculating the consolidated retention fund")
+
+    if "consolidated_paysheet_summary" in st.session_state and not st.session_state["consolidated_paysheet_summary"].empty:
+        summary = st.session_state["consolidated_paysheet_summary"]
+        combined = st.session_state["consolidated_paysheet_result"]
 
         st.divider()
+        st.markdown("### Report")
 
-        # ------------------------------------------------------------
-        # STEP 3: Configure Retention Settings & Calculate
-        # ------------------------------------------------------------
-        st.markdown("### Step 3: Configure & Calculate")
+        st.markdown("#### Consolidated Summary (per employee, across all uploaded months)")
+        st.dataframe(summary, use_container_width=True, height=400)
 
-        st.markdown("#### Ignored Company Codes (excluded from deduction)")
-        with st.expander("Manage ignored company codes", expanded=False):
-            st.caption(
-                "Employees whose Company Code matches any entry below will never have a retention "
-                "fund deduction applied. 'IGNITE' is the default, but you can add or remove any code."
+        total_employees = summary["ERP"].nunique()
+        pending_mask = summary["Latest Status"] == "Pending Release"
+        pending_count = int(pending_mask.sum())
+        total_deduction = summary["Total Deduction Accumulated"].sum()
+
+        sum_col1, sum_col2, sum_col3 = st.columns(3)
+        sum_col1.metric("Employees in Report", total_employees)
+        sum_col2.metric("Pending Deductions", pending_count)
+        sum_col3.metric("Total Accumulated Deduction", f"₹{total_deduction:,.0f}")
+
+        st.markdown("#### Breakdown by Company Code")
+        if "Company Code" in summary.columns:
+            cc_summary = summary.groupby("Company Code").agg(
+                **{
+                    "Total Deduction": ("Total Deduction Accumulated", "sum"),
+                    "Pending Count": ("Latest Status", lambda x: (x == "Pending Release").sum()),
+                    "Employee Count": ("ERP", "count"),
+                }
             )
-
-            ignored_codes = load_ignored_company_codes()
-
-            if ignored_codes:
-                for i, code in enumerate(ignored_codes):
-                    c1, c2 = st.columns([5, 1])
-                    c1.write(f"• `{code}`")
-                    if c2.button("Remove", key=f"remove_ignore_cc_{i}"):
-                        save_ignored_company_codes([c for c in ignored_codes if c != code])
-                        st.rerun()
-            else:
-                st.info("No company codes are currently ignored — deduction applies to everyone.")
-
-            add_col1, add_col2 = st.columns([4, 1])
-            new_ignore_code = add_col1.text_input("Add a company code to ignore", key="new_ignore_cc_input")
-            if add_col2.button("Add", key="add_ignore_cc_btn"):
-                new_code_clean = new_ignore_code.strip().upper()
-                if not new_code_clean:
-                    st.warning("Enter a company code first.")
-                elif new_code_clean in ignored_codes:
-                    st.warning(f"'{new_code_clean}' is already in the ignore list.")
-                else:
-                    save_ignored_company_codes(ignored_codes + [new_code_clean])
-                    st.success(f"Added '{new_code_clean}' to the ignore list.")
-                    st.rerun()
-
-        st.markdown("#### Retention Settings")
-
-        ret_col1, ret_col2 = st.columns(2)
-        with ret_col1:
-            deduction_pct = st.number_input(
-                "Deduction Percentage (%)",
-                min_value=0.0,
-                max_value=100.0,
-                value=10.0,
-                key="deduction_pct",
-            )
-        with ret_col2:
-            # Minimum tenure in months to apply deduction
-            min_tenure = st.number_input(
-                "Minimum Tenure (months) to Apply Deduction",
-                min_value=0,
-                value=12,
-                key="min_tenure",
-                help="Used to calculate each new joiner's expected release date.",
-            )
-
-        current_ignored = load_ignored_company_codes()
-        st.caption(
-            f"Ignored company codes currently applied: **{', '.join(current_ignored) if current_ignored else 'None'}** "
-            "(manage above)."
-        )
-
-        st.markdown("##### Payroll Cycle (26th → 25th) & New Joiner Tagging")
-        st.caption(
-            "The retention fund deduction is applied to **New Joiners** — employees whose Joining "
-            "Date falls inside the payroll cycle being processed. Existing employees, already "
-            "deducted in an earlier cycle, are not re-deducted."
-        )
-        cycle_col1, cycle_col2 = st.columns(2)
-        with cycle_col1:
-            cycle_reference_date = st.date_input(
-                "Payroll cycle reference date",
-                value=date.today(),
-                key="cycle_reference_date",
-                help="Pick any date inside the payroll cycle you're processing; the 26th–25th window is derived automatically.",
-            )
-        with cycle_col2:
-            new_joiners_only = st.checkbox(
-                "Deduct only New Joiners in this cycle",
-                value=True,
-                key="new_joiners_only",
-                help="Uncheck to apply deduction to every eligible employee regardless of Joining Date.",
-            )
-
-        cycle_start, cycle_end = get_payroll_cycle(cycle_reference_date)
-        st.caption(
-            f"Current payroll cycle: **{format_date_ddmmmyyyy(cycle_start)} → {format_date_ddmmmyyyy(cycle_end)}**"
-        )
-
-        if st.button("Calculate Retention Fund Deduction", key="calc_retention"):
-            try:
-                work_df = df.copy()
-
-                # Tag new joiners for this payroll cycle
-                work_df = tag_new_joiners(work_df, joining_col, cycle_start, cycle_end)
-
-                # Compute deductions
-                result = compute_retention_fund_deduction(
-                    work_df,
-                    erp_col=erp_col,
-                    name_col=name_col,
-                    cc_col=cc_col,
-                    branch_col=branch_col,
-                    salary_col=salary_col,
-                    deduction_pct=deduction_pct,
-                    ignored_company_codes=load_ignored_company_codes(),
-                    new_joiner_only=new_joiners_only,
-                )
-
-                # Categorize retention status
-                result = categorize_retention_status(result)
-
-                # Calculate expected release date
-                result["Expected Release Date"] = result[joining_col].apply(
-                    lambda x: calculate_expected_release_date(x, min_tenure)
-                )
-
-                # Format expected release date for display (dd-mmm-yyyy)
-                result["Expected Release Date Formatted"] = result["Expected Release Date"].apply(format_date_ddmmmyyyy)
-
-                # Store deduction counts
-                deduction_counts = count_deductions_by_status(result)
-                st.session_state["deduction_counts"] = deduction_counts
-                st.session_state["payroll_cycle"] = (cycle_start, cycle_end)
-
-                st.session_state["retention_result"] = result
-                st.success(
-                    f"✅ Retention fund calculation completed for payroll cycle "
-                    f"{format_date_ddmmmyyyy(cycle_start)} → {format_date_ddmmmyyyy(cycle_end)}!"
-                )
-
-            except Exception as e:
-                _show_error(e, "calculating retention fund deduction")
-
-        if "retention_result" in st.session_state:
-            result = st.session_state["retention_result"]
-            deduction_counts = st.session_state.get("deduction_counts", {})
-
-            st.divider()
-            st.markdown("### Report")
-
-            st.markdown("#### Retention Fund Deduction Details")
-            st.dataframe(result, use_container_width=True, height=400)
-
-            # Summary metrics
-            st.markdown("#### Summary Statistics")
-
-            total_employees = len(result)
-            new_joiners_count = int(result["New Joiner"].sum()) if "New Joiner" in result.columns else 0
-            deduction_employees = (result["Deduction Applicable"] == True).sum()
-            no_deduction_employees = (result["Deduction Applicable"] == False).sum()
-            total_deduction = result["Deduction Amount"].sum()
-            pending_count = deduction_counts.get("Pending", 0)
-
-            sum_col1, sum_col2, sum_col3, sum_col4, sum_col5, sum_col6 = st.columns(6)
-            sum_col1.metric("Total Employees", total_employees)
-            sum_col2.metric("New Joiners This Cycle", new_joiners_count)
-            sum_col3.metric("Employees with Deduction", deduction_employees)
-            sum_col4.metric("Employees without Deduction", no_deduction_employees)
-            sum_col5.metric("Pending Deductions", pending_count)
-            sum_col6.metric("Total Accumulated Deduction", f"₹{total_deduction:,.0f}")
-
-            if deduction_employees > 0:
-                avg_deduction = result[result["Deduction Amount"] > 0]["Deduction Amount"].mean()
-                st.metric("Average Deduction per Employee", f"₹{avg_deduction:,.0f}")
-
-            # Breakdown by Company Code
-            st.markdown("#### Deduction Breakdown by Company Code")
-            cc_summary = (
-                result.groupby(cc_col)
-                .agg({
-                    "Deduction Amount": "sum",
-                    "Status": lambda x: (x == "Pending Release").sum(),
-                    erp_col: "count",
-                })
-                .rename(columns={"Status": "Pending Count"})
-            )
-            cc_summary.columns = ["Total Deduction", "Pending Count", "Employee Count"]
             st.dataframe(cc_summary, use_container_width=True)
 
-            # Breakdown by Branch
-            st.markdown("#### Deduction Breakdown by Branch")
-            branch_summary = (
-                result.groupby(branch_col)
-                .agg({
-                    "Deduction Amount": "sum",
-                    "Status": lambda x: (x == "Pending Release").sum(),
-                    erp_col: "count",
-                })
-                .rename(columns={"Status": "Pending Count"})
+        st.markdown("#### Breakdown by Branch")
+        if "Branch" in summary.columns:
+            branch_summary = summary.groupby("Branch").agg(
+                **{
+                    "Total Deduction": ("Total Deduction Accumulated", "sum"),
+                    "Pending Count": ("Latest Status", lambda x: (x == "Pending Release").sum()),
+                    "Employee Count": ("ERP", "count"),
+                }
             )
-            branch_summary.columns = ["Total Deduction", "Pending Count", "Employee Count"]
             st.dataframe(branch_summary, use_container_width=True)
 
-            # Pending Deductions Summary — plain-language, e.g. "3 deductions
-            # pending", "1 deduction pending with employee <name>"
-            st.markdown("#### Pending Deductions Summary")
-            pending_all = result[result["Status"] == "Pending Release"]
-            st.markdown(pending_deduction_sentence("Overall", pending_all, name_col))
-            for code, grp in result.groupby(cc_col):
-                grp_pending = grp[grp["Status"] == "Pending Release"]
-                st.markdown(pending_deduction_sentence(str(code), grp_pending, name_col))
+        st.markdown("#### Pending Deductions Summary")
+        pending_all = summary[pending_mask]
+        st.markdown(pending_deduction_sentence("Overall", pending_all, "ERP"))
 
-            # List of employees with pending releases
-            st.markdown("#### Employees with Pending Release")
-            pending = result[result["Status"] == "Pending Release"][
-                [erp_col, name_col, cc_col, branch_col, salary_col, "Deduction Amount", "Expected Release Date Formatted"]
-            ].copy()
-            pending.columns = [erp_col, name_col, cc_col, branch_col, salary_col, "Deduction Amount", "Expected Release Date"]
+        st.markdown("#### Employees with Pending Release")
+        pending_cols = [c for c in ["ERP", "Branch", "Designation", "Company Code", "Total Deduction Accumulated", "Months Processed"] if c in summary.columns]
+        pending_view = summary[pending_mask][pending_cols]
+        if not pending_view.empty:
+            st.dataframe(pending_view, use_container_width=True)
+        else:
+            st.info("No employees with pending releases.")
 
-            if not pending.empty:
-                st.dataframe(pending, use_container_width=True)
-            else:
-                st.info("No employees with pending releases.")
+        st.markdown("#### Month-wise Detail")
+        with st.expander("View month-by-month deduction detail", expanded=False):
+            st.dataframe(combined, use_container_width=True, height=400)
 
-            # Download results
-            st.markdown("#### Download Report")
+        st.markdown("#### Download Report")
+        download_button_for_df(
+            summary,
+            "⬇️ Download Consolidated Summary",
+            f"retention_fund_consolidated_summary_{datetime.now().strftime('%Y%m%d')}.xlsx",
+        )
+        download_button_for_df(
+            combined,
+            "⬇️ Download Month-wise Detail",
+            f"retention_fund_monthwise_detail_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            key="dl_monthwise",
+        )
+        if not pending_view.empty:
             download_button_for_df(
-                result,
-                "⬇️ Download Full Report",
-                f"retention_fund_report_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                pending_view,
+                "⬇️ Download Pending Releases",
+                f"retention_fund_pending_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                key="dl_pending",
             )
-
-            # Download pending releases only
-            if not pending.empty:
-                download_button_for_df(
-                    pending,
-                    "⬇️ Download Pending Releases",
-                    f"retention_fund_pending_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                    key="dl_pending",
-                )
 
 
 # ================================================================
-# TAB 2: RETENTION FUND DASHBOARD (analytics)
+# TAB 2: CUSTOMIZE DASHBOARD
+# ================================================================
+with tab_customize:
+    st.markdown("### Customize Dashboard")
+    st.caption(
+        "The per-employee profile that drives reporting and retention eligibility: Branch, Designation, "
+        "Employment Type, Company Code, and whether Retention Fund is Applicable (Yes/No). "
+        "An ERP with no profile here, or **Retention Applicable = No**, will never get a deduction."
+    )
+
+    st.markdown("#### Bulk Upload (Branch, Company Code, Designation)")
+    st.caption(
+        "Upload a file with **ERP, Branch, Company Code, Designation** only — Employment Type and "
+        "Retention Applicable are managed as dropdowns in the table below and are **not** overwritten "
+        "by a bulk upload for ERPs that already have a value set; brand-new ERPs default to "
+        "'Full Time' / 'Yes' until you change them."
+    )
+
+    bulk_sample = sample_customize_dashboard_bulk_template()
+    st.dataframe(bulk_sample, use_container_width=True)
+    st.download_button(
+        "⬇️ Download bulk upload template",
+        data=to_excel_bytes({"Template": bulk_sample}),
+        file_name="customize_dashboard_bulk_template.xlsx",
+        key="dl_customize_bulk_template",
+    )
+
+    bulk_file = st.file_uploader(
+        "Upload Branch / Company Code / Designation (.xlsx or .csv)",
+        type=["xlsx", "xls", "csv"],
+        key="customize_bulk_upload",
+    )
+
+    if bulk_file:
+        try:
+            bulk_df = read_any_table(bulk_file)
+            erp_col = auto_detect_column(bulk_df, ["erp", "emp id", "employee id"])
+            branch_col = auto_detect_column(bulk_df, ["branch"])
+            cc_col = auto_detect_column(bulk_df, ["cc", "company code", "company"])
+            designation_col = auto_detect_column(bulk_df, ["designation", "role", "title"])
+
+            missing = []
+            if not erp_col:
+                missing.append("ERP")
+            if not branch_col:
+                missing.append("Branch")
+            if not cc_col:
+                missing.append("Company Code")
+            if not designation_col:
+                missing.append("Designation")
+
+            if missing:
+                st.error(f"❌ Missing required columns: {', '.join(missing)}")
+            else:
+                existing = load_customize_dashboard()
+                merged = merge_customize_dashboard_bulk_upload(
+                    existing, bulk_df,
+                    erp_col=erp_col, branch_col=branch_col, cc_col=cc_col, designation_col=designation_col,
+                )
+                save_customize_dashboard(merged)
+                st.success(f"✅ Merged {len(bulk_df)} row(s) into the Customize Dashboard ({len(merged)} total employees).")
+                st.rerun()
+        except Exception as e:
+            _show_error(e, "processing the bulk upload")
+
+    st.divider()
+
+    st.markdown("#### Employee Profiles")
+    st.caption(
+        "Edit Employment Type and Retention Applicable directly below (dropdowns). Add a brand-new "
+        "ERP by typing into the blank row at the bottom. Click **Save Changes** when done."
+    )
+
+    dashboard_df = load_customize_dashboard()
+    if dashboard_df.empty:
+        dashboard_df = pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
+
+    edited_df = st.data_editor(
+        dashboard_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="customize_dashboard_editor",
+        column_config={
+            "Employment Type": st.column_config.SelectboxColumn(
+                "Employment Type", options=EMPLOYMENT_TYPE_OPTIONS, required=False,
+            ),
+            "Retention Applicable": st.column_config.SelectboxColumn(
+                "Retention Applicable", options=RETENTION_APPLICABLE_OPTIONS, required=False,
+            ),
+        },
+    )
+
+    if st.button("💾 Save Changes", key="save_customize_dashboard_btn"):
+        save_customize_dashboard(edited_df)
+        st.success("Customize Dashboard saved.")
+        st.rerun()
+
+
+# ================================================================
+# TAB 3: ANALYTICS DASHBOARD
 # ================================================================
 with tab_dashboard:
     st.markdown("#### Dashboard Overview")
 
-    if "retention_result" in st.session_state and not st.session_state["retention_result"].empty:
-        result = st.session_state["retention_result"]
+    if "consolidated_paysheet_summary" in st.session_state and not st.session_state["consolidated_paysheet_summary"].empty:
+        summary = st.session_state["consolidated_paysheet_summary"]
+        combined = st.session_state["consolidated_paysheet_result"]
 
-        cycle = st.session_state.get("payroll_cycle")
-        if cycle:
-            st.caption(f"Payroll cycle: **{format_date_ddmmmyyyy(cycle[0])} → {format_date_ddmmmyyyy(cycle[1])}**")
-
-        total_employees = len(result)
-        new_joiners_count = int(result["New Joiner"].sum()) if "New Joiner" in result.columns else 0
-        total_deduction_happened = result["Deduction Amount"].sum()
-        pending_mask = result["Status"] == "Pending Release"
-        total_deduction_pending = result.loc[pending_mask, "Deduction Amount"].sum()
+        total_employees = summary["ERP"].nunique()
+        pending_mask = summary["Latest Status"] == "Pending Release"
         pending_count = int(pending_mask.sum())
+        total_deduction = summary["Total Deduction Accumulated"].sum()
+        months_covered = combined["Paysheet Month"].nunique() if "Paysheet Month" in combined.columns else 0
 
-        # Key Metrics — only the crucial attributes
         st.markdown("### Key Metrics")
-        kcol1, kcol2, kcol3, kcol4, kcol5 = st.columns(5)
-        kcol1.metric("Total Employees", total_employees)
-        kcol2.metric("New Joiners This Cycle", new_joiners_count)
-        kcol3.metric("Total Deduction Happened", f"₹{total_deduction_happened:,.0f}")
-        kcol4.metric("Total Deduction Pending", f"₹{total_deduction_pending:,.0f}")
-        kcol5.metric("Employees Awaiting Release", pending_count)
+        kcol1, kcol2, kcol3, kcol4 = st.columns(4)
+        kcol1.metric("Employees in Report", total_employees)
+        kcol2.metric("Months Covered", months_covered)
+        kcol3.metric("Total Deduction Accumulated", f"₹{total_deduction:,.0f}")
+        kcol4.metric("Employees Awaiting Release", pending_count)
 
-        st.markdown(pending_deduction_sentence(
-            "Overall", result[pending_mask],
-            "Name" if "Name" in result.columns else result.columns[1],
-        ))
+        st.markdown(pending_deduction_sentence("Overall", summary[pending_mask], "ERP"))
 
-        # Release Month — when pending amounts are due for release
-        st.markdown("### Release Month")
-        if "Expected Release Date" in result.columns:
-            pending_only = result[pending_mask].copy()
-            if not pending_only.empty:
-                pending_only["Release Month"] = pd.to_datetime(
-                    pending_only["Expected Release Date"], errors="coerce"
-                ).dt.strftime("%b-%Y")
-                release_summary = (
-                    pending_only.groupby("Release Month")["Deduction Amount"]
-                    .agg(["sum", "count"])
-                    .round(2)
-                )
-                release_summary.columns = ["Total Pending Amount", "Employees"]
-                try:
-                    release_summary = release_summary.reindex(
-                        sorted(release_summary.index, key=lambda m: pd.to_datetime(m, format="%b-%Y"))
-                    )
-                except Exception:
-                    pass
-                st.dataframe(release_summary, use_container_width=True)
-            else:
-                st.info("No pending releases to show.")
+        st.markdown("### Employment Type Breakdown")
+        if "Employment Type" in summary.columns:
+            et_summary = summary.groupby("Employment Type").agg(
+                **{
+                    "Total Deduction": ("Total Deduction Accumulated", "sum"),
+                    "Employee Count": ("ERP", "count"),
+                }
+            )
+            st.dataframe(et_summary, use_container_width=True)
 
-        # Downloads
+        st.markdown("### Monthly Trend")
+        if "Paysheet Month" in combined.columns:
+            monthly_trend = (
+                combined.groupby(combined["Paysheet Month"].dt.strftime("%b-%Y"))["Deduction Amount"]
+                .sum()
+                .rename("Total Deduction")
+            )
+            st.bar_chart(monthly_trend)
+
         st.markdown("### Download Reports")
         download_button_for_df(
-            result,
-            "⬇️ Download Full Dashboard Report",
-            f"retention_dashboard_full_{datetime.now().strftime('%Y%m%d')}.xlsx",
+            summary,
+            "⬇️ Download Full Dashboard Summary",
+            f"retention_dashboard_summary_{datetime.now().strftime('%Y%m%d')}.xlsx",
             key="dl_dashboard_full",
         )
-
-        pending_df = result[pending_mask].copy()
+        pending_df = summary[pending_mask]
         if not pending_df.empty:
             download_button_for_df(
                 pending_df,
@@ -616,6 +551,8 @@ with tab_dashboard:
                 f"retention_pending_releases_{datetime.now().strftime('%Y%m%d')}.xlsx",
                 key="dl_pending_releases",
             )
-
     else:
-        st.info("📌 No retention fund data available. Please calculate retention fund deductions from the Tracker tab first.")
+        st.info(
+            "📌 No retention fund data available. Upload paysheets and calculate from the "
+            "**Retention Fund Compute** tab first."
+        )
