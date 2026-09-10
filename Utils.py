@@ -173,7 +173,9 @@ SENSITIVE_SESSION_KEYS = [
     "gig_result",
     "retention_fund_data",
     "retention_result",
-    "internal_transfers",
+    "consolidated_paysheets",
+    "consolidated_paysheet_result",
+    "consolidated_paysheet_summary",
 ]
 
 
@@ -235,13 +237,7 @@ def sample_attendance_muster() -> pd.DataFrame:
 def count_absences(df: pd.DataFrame, id_cols: list, absence_marker: str = "A") -> pd.DataFrame:
     """Given an attendance muster where `id_cols` identify the employee and
     all other columns are day-wise attendance marks, count how many times
-    `absence_marker` (default 'A') appears for each employee.
-
-    Also captures the columns that could not be counted (in case some
-    non-date extra columns sneak in) — but by default we just count on
-    every non-id column, so make sure the caller has picked id_cols
-    correctly.
-    """
+    `absence_marker` (default 'A') appears for each employee."""
     day_cols = [c for c in df.columns if c not in id_cols]
 
     def count_row(row):
@@ -283,7 +279,8 @@ DEFAULT_ABSENCE_THRESHOLDS = [
 
 
 # --------------------------------------------------------------------------
-# 2. Retention Fund Tracking
+# 2. Retention Fund — shared config storage (Company Codes, Exceptional
+#    ERPs, and the Customize Dashboard employee profile)
 # --------------------------------------------------------------------------
 
 # Company codes ignored (excluded) from retention fund deduction. Stored as
@@ -296,6 +293,8 @@ DEFAULT_IGNORED_COMPANY_CODES = ["IGNITE"]
 _APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_APP_ROOT, "..", "data")
 _IGNORED_CC_FILE = os.path.join(_DATA_DIR, "ignored_company_codes.json")
+_EXCEPTIONAL_ERP_FILE = os.path.join(_DATA_DIR, "exceptional_erps.json")
+_CUSTOMIZE_DASHBOARD_FILE = os.path.join(_DATA_DIR, "customize_dashboard.json")
 
 
 def load_ignored_company_codes() -> list:
@@ -323,8 +322,140 @@ def save_ignored_company_codes(codes: list):
         json.dump(clean, f, indent=2)
 
 
+def load_exceptional_erps() -> list:
+    """Returns the list of ERPs that must NEVER have a retention fund
+    deduction applied — a hard, per-employee exclusion that overrides
+    everything else (Company Code, Retention Applicable = Yes, etc). Use
+    this for one-off cases (e.g. a settlement, a special employment
+    contract) that don't fit a whole Company Code being ignored."""
+    if not os.path.exists(_EXCEPTIONAL_ERP_FILE):
+        return []
+    try:
+        with open(_EXCEPTIONAL_ERP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and all(isinstance(c, str) for c in data):
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def save_exceptional_erps(erps: list):
+    """Persists the exceptional-ERPs list (deduplicated, uppercased,
+    sorted)."""
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    clean = sorted({str(e).strip().upper() for e in erps if str(e).strip()})
+    with open(_EXCEPTIONAL_ERP_FILE, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2)
+
+
+# --- Customize Dashboard: the per-employee profile (Branch, Designation,
+# Employment Type, Company Code, Retention Applicable) that drives both
+# reporting breakdowns and deduction eligibility. This is now the single
+# place these attributes live — paysheet uploads only carry the financial
+# figures (ERP, First Hire Date, Net Pay, Gross).
+
+EMPLOYMENT_TYPE_OPTIONS = ["Full Time", "Contractual", "Part Time"]
+RETENTION_APPLICABLE_OPTIONS = ["Yes", "No"]
+
+CUSTOMIZE_DASHBOARD_COLUMNS = [
+    "ERP", "Branch", "Designation", "Employment Type", "Company Code", "Retention Applicable",
+]
+
+
+def load_customize_dashboard() -> pd.DataFrame:
+    """Loads the Customize Dashboard employee profile table. Returns an
+    empty (but correctly-shaped) DataFrame if nothing has been saved yet."""
+    if not os.path.exists(_CUSTOMIZE_DASHBOARD_FILE):
+        return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
+    try:
+        with open(_CUSTOMIZE_DASHBOARD_FILE, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        df = pd.DataFrame(records)
+        for col in CUSTOMIZE_DASHBOARD_COLUMNS:
+            if col not in df.columns:
+                df[col] = None
+        return df[CUSTOMIZE_DASHBOARD_COLUMNS]
+    except Exception:
+        return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
+
+
+def save_customize_dashboard(df: pd.DataFrame):
+    """Persists the Customize Dashboard table, one row per ERP (last
+    occurrence wins if there are duplicate ERPs)."""
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    out = df.copy()
+    for col in CUSTOMIZE_DASHBOARD_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+    out["ERP"] = out["ERP"].astype(str).str.strip()
+    out = out[out["ERP"] != ""]
+    out = out.drop_duplicates(subset=["ERP"], keep="last")
+    with open(_CUSTOMIZE_DASHBOARD_FILE, "w", encoding="utf-8") as f:
+        json.dump(out[CUSTOMIZE_DASHBOARD_COLUMNS].to_dict(orient="records"), f, indent=2, default=str)
+
+
+def sample_customize_dashboard_bulk_template() -> pd.DataFrame:
+    """Sample file for the Customize Dashboard bulk upload. Only ERP,
+    Branch, Company Code and Designation are required in the file —
+    Employment Type and Retention Applicable are managed afterwards as
+    dropdowns directly in the dashboard table (existing values are kept on
+    re-upload; new ERPs default to 'Full Time' / 'Yes' until changed)."""
+    return pd.DataFrame([
+        {"ERP": "E001", "Branch": "Koramangala", "Company Code": "MAIN", "Designation": "Sales Executive"},
+        {"ERP": "E002", "Branch": "Whitefield", "Company Code": "MAIN", "Designation": "Store Manager"},
+    ])
+
+
+def merge_customize_dashboard_bulk_upload(
+    existing_df: pd.DataFrame,
+    upload_df: pd.DataFrame,
+    erp_col: str,
+    branch_col: str,
+    cc_col: str,
+    designation_col: str,
+) -> pd.DataFrame:
+    """Merges a bulk upload that only has ERP / Branch / Company Code /
+    Designation into the existing Customize Dashboard.
+
+    Employment Type and Retention Applicable are auto-carried forward from
+    whatever is already saved for that ERP (so re-uploading the bulk sheet
+    never silently resets someone's employment type or Yes/No status).
+    Brand-new ERPs are auto-filled with defaults ('Full Time' / 'Yes')
+    which can then be adjusted in the dashboard's dropdown columns.
+    """
+    existing = existing_df.copy()
+    for col in CUSTOMIZE_DASHBOARD_COLUMNS:
+        if col not in existing.columns:
+            existing[col] = None
+    existing["ERP"] = existing["ERP"].astype(str).str.strip()
+    existing_by_erp = existing.set_index("ERP").to_dict(orient="index")
+
+    rows = []
+    for _, row in upload_df.iterrows():
+        erp = str(row.get(erp_col, "")).strip()
+        if not erp:
+            continue
+        prior = existing_by_erp.get(erp, {})
+        rows.append({
+            "ERP": erp,
+            "Branch": row.get(branch_col),
+            "Designation": row.get(designation_col),
+            "Company Code": row.get(cc_col),
+            "Employment Type": prior.get("Employment Type") or "Full Time",
+            "Retention Applicable": prior.get("Retention Applicable") or "Yes",
+        })
+
+    new_df = pd.DataFrame(rows, columns=CUSTOMIZE_DASHBOARD_COLUMNS)
+    untouched = existing[~existing["ERP"].isin(new_df["ERP"])]
+    merged = pd.concat([untouched, new_df], ignore_index=True)
+    return merged.drop_duplicates(subset=["ERP"], keep="last").reset_index(drop=True)
+
+
 # --------------------------------------------------------------------------
-# Payroll cycle (26th of a month -> 25th of the next) & New Joiner tagging
+# Payroll cycle (26th of a month -> 25th of the next) — kept as a general
+# helper; retention fund deduction itself is now driven by First Hire Date
+# month rather than this cycle (see tag_first_hire_status below).
 # --------------------------------------------------------------------------
 
 def get_payroll_cycle(reference_date=None) -> tuple:
@@ -359,24 +490,6 @@ def get_payroll_cycle(reference_date=None) -> tuple:
     return cycle_start, cycle_end
 
 
-def tag_new_joiners(df: pd.DataFrame, joining_col: str, cycle_start, cycle_end) -> pd.DataFrame:
-    """Adds a boolean 'New Joiner' column: True when the employee's Joining
-    Date falls inside [cycle_start, cycle_end] — the payroll cycle being
-    processed (26th of a month to 25th of the next).
-
-    Retention fund deduction is meant to be triggered only for employees
-    who are new joiners in the cycle being processed: existing employees
-    were already deducted in an earlier cycle's run and shouldn't have the
-    deduction re-applied every time the master sheet is re-uploaded.
-    """
-    out = df.copy()
-    joining_dt = pd.to_datetime(out[joining_col], errors="coerce")
-    cycle_start_ts = pd.Timestamp(cycle_start)
-    cycle_end_ts = pd.Timestamp(cycle_end)
-    out["New Joiner"] = (joining_dt >= cycle_start_ts) & (joining_dt <= cycle_end_ts)
-    return out
-
-
 def format_date_ddmmmyyyy(value) -> str:
     """Formats a date/datetime/parsable string as dd-mmm-yyyy, e.g.
     '08-Sep-2026'. Returns '' for null/unparseable values rather than
@@ -409,403 +522,8 @@ def pending_deduction_sentence(label: str, pending_df: pd.DataFrame, name_col: s
     return f"**{label}**: {count} deductions pending."
 
 
-def sample_employee_master_for_retention() -> pd.DataFrame:
-    """Sample employee master sheet for retention fund tracking.
-    
-    Columns: ERP, Name, Joining Date, Company Code (CC), Branch, 
-    Gross Salary
-    """
-    return pd.DataFrame([
-        {
-            "ERP": "E001",
-            "Name": "Ravi Kumar",
-            "Joining Date": "2020-01-15",
-            "Company Code": "IGNITE",
-            "Branch": "Koramangala",
-            "Gross Salary": 25000.00,
-        },
-        {
-            "ERP": "E002",
-            "Name": "Sita Sharma",
-            "Joining Date": "2021-06-10",
-            "Company Code": "MAIN",
-            "Branch": "Koramangala",
-            "Gross Salary": 35000.00,
-        },
-        {
-            "ERP": "E003",
-            "Name": "Mohan Das",
-            "Joining Date": "2019-03-20",
-            "Company Code": "MAIN",
-            "Branch": "Whitefield",
-            "Gross Salary": 40000.00,
-        },
-    ])
-
-
-def sample_internal_transfer_template() -> pd.DataFrame:
-    """Sample internal transfer data for retention fund tracking.
-    
-    Columns: ERP, Name, Old Branch, Old Branch CC, New Branch, New Branch CC, 
-    Gross Change Amount
-    """
-    return pd.DataFrame([
-        {
-            "ERP": "E001",
-            "Name": "Ravi Kumar",
-            "Old Branch": "Koramangala",
-            "Old Branch CC": "MAIN",
-            "New Branch": "Whitefield",
-            "New Branch CC": "MAIN",
-            "Gross Change Amount": 0.00,
-        },
-        {
-            "ERP": "E002",
-            "Name": "Sita Sharma",
-            "Old Branch": "Koramangala",
-            "Old Branch CC": "MAIN",
-            "New Branch": "Bangalore",
-            "New Branch CC": "IGNITE",
-            "Gross Change Amount": 5000.00,
-        },
-        {
-            "ERP": "E003",
-            "Name": "Mohan Das",
-            "Old Branch": "Whitefield",
-            "Old Branch CC": "MAIN",
-            "New Branch": "Koramangala",
-            "New Branch CC": "MAIN",
-            "Gross Change Amount": -2000.00,
-        },
-    ])
-
-
-def compute_retention_fund_deduction(
-    df: pd.DataFrame,
-    erp_col: str,
-    name_col: str,
-    cc_col: str,
-    branch_col: str,
-    salary_col: str,
-    deduction_pct: float = 10.0,
-    ignored_company_codes: list = None,
-    new_joiner_only: bool = False,
-    new_joiner_col: str = "New Joiner",
-) -> pd.DataFrame:
-    """Compute retention fund deduction on earned gross salary.
-    
-    Args:
-        df: Employee master DataFrame
-        erp_col: Column name for ERP ID
-        name_col: Column name for employee name
-        cc_col: Column name for company code (CC)
-        branch_col: Column name for branch
-        salary_col: Column name for gross salary
-        deduction_pct: Deduction percentage (default 10%)
-        ignored_company_codes: Company codes to exclude from deduction
-            entirely (case-insensitive). Pass the list from
-            load_ignored_company_codes() to respect the admin-managed
-            ignore list. None / empty list applies deduction to everyone.
-        new_joiner_only: If True, deduction is applied only to rows where
-            `new_joiner_col` is True — i.e. only employees who are new
-            joiners in the payroll cycle being processed. Use
-            tag_new_joiners() to add that column before calling this with
-            new_joiner_only=True. Existing employees (already deducted in
-            an earlier cycle) are left with no deduction this run.
-        new_joiner_col: Name of the boolean "is a new joiner" column to
-            check when new_joiner_only=True.
-    
-    Returns:
-        DataFrame with retention fund calculations
-    """
-    out = df.copy()
-    
-    # Coerce salary column to numeric
-    out[salary_col] = coerce_numeric_column(out[salary_col], salary_col)
-    
-    # Determine if deduction applies (anyone in the ignore list is excluded)
-    ignored_upper = {str(c).strip().upper() for c in (ignored_company_codes or []) if str(c).strip()}
-    if ignored_upper:
-        applicable = ~out[cc_col].astype(str).str.upper().isin(ignored_upper)
-    else:
-        applicable = pd.Series(True, index=out.index)
-
-    if new_joiner_only:
-        if new_joiner_col not in out.columns:
-            raise ValueError(
-                f"Column '{new_joiner_col}' not found. Call tag_new_joiners() to add it "
-                "before computing deduction with new_joiner_only=True."
-            )
-        applicable = applicable & out[new_joiner_col].astype(bool)
-
-    out["Deduction Applicable"] = applicable
-    
-    # Calculate deduction amount (only where applicable)
-    out["Deduction Amount"] = 0.0
-    out.loc[out["Deduction Applicable"], "Deduction Amount"] = (
-        out.loc[out["Deduction Applicable"], salary_col] * deduction_pct / 100
-    )
-    
-    # Calculate accumulated amount (can be summed over multiple months)
-    out["Amount After Deduction"] = out[salary_col] - out["Deduction Amount"]
-    
-    return out
-
-
-def categorize_retention_status(df: pd.DataFrame) -> pd.DataFrame:
-    """Categorize retention fund status for each employee.
-    
-    Returns DataFrame with additional 'Status' column indicating:
-    - No Deduction: Deduction not applicable
-    - Pending Release: Has accumulated deduction pending release
-    """
-    out = df.copy()
-    
-    def get_status(row):
-        if not row.get("Deduction Applicable", False):
-            return "No Deduction"
-        deduction = row.get("Deduction Amount", 0)
-        if deduction > 0:
-            return "Pending Release"
-        return "Not Applicable"
-    
-    out["Status"] = out.apply(get_status, axis=1)
-    return out
-
-
-def filter_by_company_code(df: pd.DataFrame, cc_col: str, company_codes: list) -> pd.DataFrame:
-    """Filter employee data by company codes.
-    
-    Args:
-        df: Employee DataFrame
-        cc_col: Column name for company code
-        company_codes: List of company codes to include
-    
-    Returns:
-        Filtered DataFrame
-    """
-    if not company_codes:
-        return df
-    return df[df[cc_col].astype(str).str.upper().isin([cc.upper() for cc in company_codes])]
-
-
-def filter_by_branch(df: pd.DataFrame, branch_col: str, branches: list) -> pd.DataFrame:
-    """Filter employee data by branches.
-    
-    Args:
-        df: Employee DataFrame
-        branch_col: Column name for branch
-        branches: List of branches to include
-    
-    Returns:
-        Filtered DataFrame
-    """
-    if not branches:
-        return df
-    return df[df[branch_col].astype(str).str.upper().isin([b.upper() for b in branches])]
-
-
-def merge_internal_transfers(
-    retention_df: pd.DataFrame,
-    transfers_df: pd.DataFrame,
-    erp_col: str,
-    old_cc_col: str,
-    new_cc_col: str,
-) -> pd.DataFrame:
-    """Merge retention fund data with internal transfer data.
-    
-    Updates company code for transferred employees and tracks old CC info.
-    
-    Args:
-        retention_df: Retention fund DataFrame
-        transfers_df: Internal transfer DataFrame
-        erp_col: Column name for ERP ID
-        old_cc_col: Column name for old company code in transfers
-        new_cc_col: Column name for new company code in transfers
-    
-    Returns:
-        Updated retention DataFrame with transfer information
-    """
-    out = retention_df.copy()
-    
-    # Add columns to track transfers
-    out["Transferred"] = False
-    out["Previous CC"] = out.get("Company Code", "")
-    
-    # Merge transfer information
-    transfer_map = {}
-    for _, row in transfers_df.iterrows():
-        erp = row.get(erp_col)
-        transfer_map[erp] = {
-            "old_cc": row.get(old_cc_col),
-            "new_cc": row.get(new_cc_col),
-        }
-    
-    # Update company codes for transferred employees
-    for idx, row in out.iterrows():
-        erp = row.get(erp_col)
-        if erp in transfer_map:
-            transfer_info = transfer_map[erp]
-            out.at[idx, "Previous CC"] = transfer_info["old_cc"]
-            out.at[idx, "Company Code"] = transfer_info["new_cc"]
-            out.at[idx, "Transferred"] = True
-    
-    return out
-
-
-def sample_erp_transfer_template() -> pd.DataFrame:
-    """Sample data for tracking employees who were issued a NEW ERP ID after
-    an internal branch/company-code transfer.
-
-    Use this (rather than sample_internal_transfer_template, which assumes
-    the ERP stays the same) whenever the employee's ERP itself changes on
-    transfer — any retention fund deduction still pending release under the
-    Old ERP needs to move to the New ERP so the eventual release happens
-    against the employee's current identity.
-    """
-    return pd.DataFrame([
-        {
-            "Old ERP": "E001",
-            "New ERP": "E101",
-            "Name": "Ravi Kumar",
-            "Old Branch": "Koramangala",
-            "New Branch": "Whitefield",
-            "Old Company Code": "MAIN",
-            "New Company Code": "MAIN",
-        },
-        {
-            "Old ERP": "E002",
-            "New ERP": "E102",
-            "Name": "Sita Sharma",
-            "Old Branch": "Koramangala",
-            "New Branch": "Bangalore",
-            "Old Company Code": "MAIN",
-            "New Company Code": "IGNITE",
-        },
-    ])
-
-
-def apply_internal_transfers(
-    result_df: pd.DataFrame,
-    transfers_df: pd.DataFrame,
-    erp_col: str,
-    old_erp_col: str,
-    new_erp_col: str,
-    branch_col: str = None,
-    new_branch_col: str = None,
-    cc_col: str = None,
-    new_cc_col: str = None,
-) -> pd.DataFrame:
-    """Applies an Old-ERP -> New-ERP transfer mapping to a retention fund
-    result table.
-
-    For every transfer row, any record in `result_df` whose ERP matches the
-    Old ERP has its ERP swapped to the New ERP. The original ERP is kept in
-    a 'Previous ERP' column for audit purposes, and a 'Transferred' flag is
-    set. When supplied and present in the transfer sheet, Branch / Company
-    Code are updated to the new values too.
-
-    This is what makes a deduction that is still 'Pending Release' follow
-    the employee to their new ERP: every downstream view (pending-release
-    list, dashboard, exports) reads off `result_df[erp_col]`, so once this
-    runs, the New ERP — not the old one — is what shows up, and is what the
-    eventual release gets paid out against.
-
-    Rows in `result_df` whose ERP does not appear in the Old ERP column are
-    left completely untouched.
-    """
-    out = result_df.copy()
-
-    if "Previous ERP" not in out.columns:
-        out["Previous ERP"] = None
-    if "Transferred" not in out.columns:
-        out["Transferred"] = False
-
-    out[erp_col] = out[erp_col].astype(str)
-
-    for _, row in transfers_df.iterrows():
-        old_erp = str(row.get(old_erp_col, "")).strip()
-        new_erp = str(row.get(new_erp_col, "")).strip()
-        if not old_erp or not new_erp:
-            continue
-
-        mask = out[erp_col] == old_erp
-        if not mask.any():
-            continue
-
-        out.loc[mask, "Previous ERP"] = old_erp
-        out.loc[mask, erp_col] = new_erp
-        out.loc[mask, "Transferred"] = True
-
-        if branch_col and new_branch_col and new_branch_col in transfers_df.columns:
-            new_branch = row.get(new_branch_col)
-            if pd.notna(new_branch) and str(new_branch).strip():
-                out.loc[mask, branch_col] = new_branch
-
-        if cc_col and new_cc_col and new_cc_col in transfers_df.columns:
-            new_cc = row.get(new_cc_col)
-            if pd.notna(new_cc) and str(new_cc).strip():
-                out.loc[mask, cc_col] = new_cc
-
-    return out
-
-
-def generate_retention_report(
-    df: pd.DataFrame,
-    erp_col: str,
-    name_col: str,
-    cc_col: str,
-    branch_col: str,
-    deduction_col: str,
-    status_col: str,
-) -> dict:
-    """Generate summary statistics for retention fund report.
-    
-    Returns:
-        Dictionary with summary metrics
-    """
-    deductions = df[df[status_col] == "Pending Release"][deduction_col].sum()
-    
-    return {
-        "Total Employees": len(df),
-        "Employees with Deduction": (df[status_col] == "Pending Release").sum(),
-        "Employees without Deduction": (df[status_col] == "No Deduction").sum(),
-        "Total Accumulated Deduction": deductions,
-        "Average Deduction per Employee": deductions / max((df[status_col] == "Pending Release").sum(), 1),
-        "By Company Code": df.groupby(cc_col)[deduction_col].sum().to_dict(),
-        "By Branch": df.groupby(branch_col)[deduction_col].sum().to_dict(),
-    }
-
-
-def process_internal_transfers(
-    transfers_df: pd.DataFrame,
-    erp_col: str,
-    gross_change_col: str,
-) -> pd.DataFrame:
-    """Process internal transfer data and validate format.
-    
-    Args:
-        transfers_df: Internal transfer DataFrame
-        erp_col: Column name for ERP ID
-        gross_change_col: Column name for gross change amount
-    
-    Returns:
-        Processed transfer DataFrame with numeric columns coerced
-    """
-    out = transfers_df.copy()
-    
-    # Coerce gross change to numeric
-    if gross_change_col in out.columns:
-        out[gross_change_col] = pd.to_numeric(
-            out[gross_change_col].astype(str).str.replace(r"[₹$,\s]", "", regex=True),
-            errors="coerce"
-        ).fillna(0)
-    
-    return out
-
-
 # --------------------------------------------------------------------------
-# 3. Payroll: Full-time employees (PF + ESIC) & Gig workers (TDS)
+# Numeric coercion (shared by payroll + retention calculations)
 # --------------------------------------------------------------------------
 
 def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.Series:
@@ -816,10 +534,7 @@ def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.S
 
     Raises a ValueError naming exactly which rows couldn't be parsed (with
     up to 5 examples), instead of letting a cryptic TypeError surface deep
-    inside a downstream calculation. Blank/NaN cells are left as NaN — a
-    missing value isn't a formatting error, and callers can decide how to
-    handle it (e.g. warn and skip that row) rather than have this function
-    force a decision.
+    inside a downstream calculation. Blank/NaN cells are left as NaN.
     """
     if pd.api.types.is_numeric_dtype(series):
         return series
@@ -841,217 +556,148 @@ def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.S
 
 
 # --------------------------------------------------------------------------
-# Sample templates for payroll bulk sections
+# 2a. Retention Fund — Consolidated Paysheet computation
+#     (Deduction = min(10% of Monthly Gross, Net Pay), gated by First Hire
+#     Date, Exceptional ERPs, and the Customize Dashboard's Retention
+#     Applicable flag)
 # --------------------------------------------------------------------------
 
-def sample_fulltime_payroll_template() -> pd.DataFrame:
+CONSOLIDATED_PAYSHEET_COLUMNS = ["ERP", "First Hire Date", "Net Pay", "Monthly Gross"]
+
+
+def sample_consolidated_paysheet_template() -> pd.DataFrame:
+    """Sample monthly paysheet upload. One uploaded file = one month's
+    payroll run for the whole company. Upload one file per month you want
+    included in the consolidated retention fund computation.
+
+    Columns: ERP, First Hire Date, Net Pay, Monthly Gross.
+    """
     return pd.DataFrame([
-        {"Employee ID": "E001", "Name": "Ravi Kumar", "Basic": 15000, "HRA": 2000, "Other Allowances": 500},
-        {"Employee ID": "E002", "Name": "Sita Sharma", "Basic": 22000, "HRA": 3000, "Other Allowances": 0},
+        {"ERP": "E001", "First Hire Date": "2020-01-15", "Net Pay": 21000, "Monthly Gross": 25000},
+        {"ERP": "E002", "First Hire Date": "2021-06-10", "Net Pay": 31000, "Monthly Gross": 35000},
+        {"ERP": "E003", "First Hire Date": "2024-09-20", "Net Pay": 36000, "Monthly Gross": 40000},
     ])
 
 
-def sample_gig_billing_template() -> pd.DataFrame:
-    return pd.DataFrame([
-        {"Worker ID": "W001", "Name": "Arjun Das", "Payment Amount": 18000},
-        {"Worker ID": "W002", "Name": "Meena Iyer", "Payment Amount": 22000},
-    ])
-
-
-def sample_gross_to_inhand_template() -> pd.DataFrame:
-    return pd.DataFrame([
-        {"Employee ID": "E001", "Name": "Ravi Kumar", "Gross Salary": 17500, "Fixed Allowances": 2000},
-        {"Employee ID": "E002", "Name": "Sita Sharma", "Gross Salary": 25000, "Fixed Allowances": 3000},
-    ])
-
-
-def sample_inhand_to_gross_template() -> pd.DataFrame:
-    return pd.DataFrame([
-        {"Employee ID": "E001", "Name": "Ravi Kumar", "Desired In-Hand": 15000, "Fixed Allowances": 2000},
-        {"Employee ID": "E002", "Name": "Sita Sharma", "Desired In-Hand": 21000, "Fixed Allowances": 3000},
-    ])
-
-
-def sample_gig_inhand_to_billing_template() -> pd.DataFrame:
-    return pd.DataFrame([
-        {"Worker ID": "W001", "Name": "Arjun Das", "In-Hand Amount": 18000},
-        {"Worker ID": "W002", "Name": "Meena Iyer", "In-Hand Amount": 22000},
-    ])
-
-
-def sample_gig_billing_to_inhand_template() -> pd.DataFrame:
-    return pd.DataFrame([
-        {"Worker ID": "W001", "Name": "Arjun Das", "Billing Amount": 18180},
-        {"Worker ID": "W002", "Name": "Meena Iyer", "Billing Amount": 22220},
-    ])
-
-
-def compute_fulltime_payroll(
+def compute_paysheet_deduction(
     df: pd.DataFrame,
-    basic_col: str,
-    hra_col: str = None,
-    other_allow_col: str = None,
-    pf_wage_cap: float = 15000,
-    apply_pf_cap: bool = True,
-    pf_employee_pct: float = 12.0,
-    pf_employer_pct: float = 12.0,
-    esic_threshold: float = 21000,
-    esic_employee_pct: float = 0.75,
-    esic_employer_pct: float = 3.25,
+    erp_col: str,
+    first_hire_col: str,
+    net_pay_col: str,
+    gross_col: str,
+    paysheet_month,
+    exceptional_erps: list = None,
+    customize_dashboard: pd.DataFrame = None,
+    deduction_pct: float = 10.0,
 ) -> pd.DataFrame:
-    """Computes Gross, PF (employee + employer) and ESIC (employee + employer)
-    and Net Pay for full-time employees.
+    """Computes the retention fund deduction for a single month's paysheet.
 
-    Statutory notes (verify current rates before relying on this for actual
-    payroll compliance — rates/thresholds can change):
-      - PF: 12% of Basic (employee), 12% of Basic (employer), employee PF
-        wage capped at ₹15,000/month by default (toggle-able).
-      - ESIC: applicable only if Gross <= ₹21,000/month.
-        Employee 0.75%, Employer 3.25% of Gross.
+    Deduction = min(deduction_pct% of Monthly Gross, Net Pay) — capped at
+    Net Pay so the deduction can never exceed what the employee actually
+    took home that month.
+
+    Deduction only applies where ALL of the following hold:
+      - the ERP is not in `exceptional_erps` (a hard, per-employee
+        exclusion that overrides everything else)
+      - the ERP has a Customize Dashboard profile with
+        Retention Applicable == 'Yes' (an ERP with no profile at all, or
+        Retention Applicable == 'No', is treated as not applicable)
+      - `paysheet_month` falls on/after the employee's First Hire Date
+        month — retention fund is computed starting from the month the
+        employee was first hired, never before.
+
+    Every row keeps a 'Status' explaining why it was or wasn't deducted:
+    'Not Yet Hired', 'Exceptional ERP - Excluded', 'Retention Not
+    Applicable', 'No Deduction' (0 net pay / gross), or 'Pending Release'.
     """
     out = df.copy()
+    out[gross_col] = coerce_numeric_column(out[gross_col], gross_col)
+    out[net_pay_col] = coerce_numeric_column(out[net_pay_col], net_pay_col)
+    out[erp_col] = out[erp_col].astype(str).str.strip()
 
-    out[basic_col] = coerce_numeric_column(out[basic_col], basic_col)
-    if hra_col and hra_col in out.columns:
-        out[hra_col] = coerce_numeric_column(out[hra_col], hra_col)
-    if other_allow_col and other_allow_col in out.columns:
-        out[other_allow_col] = coerce_numeric_column(out[other_allow_col], other_allow_col)
+    hire_dt = pd.to_datetime(out[first_hire_col], errors="coerce")
+    out["First Hire Date"] = hire_dt
 
-    hra = out[hra_col] if hra_col and hra_col in out.columns else 0
-    other = out[other_allow_col] if other_allow_col and other_allow_col in out.columns else 0
+    month_ts = pd.Timestamp(paysheet_month).to_period("M").to_timestamp()
+    out["Paysheet Month"] = month_ts
+    out["Hired By This Month"] = (
+        hire_dt.dt.to_period("M").dt.to_timestamp() <= month_ts
+    ).fillna(False)
 
-    out["Gross Salary"] = out[basic_col] + hra + other
+    exceptional_upper = {str(e).strip().upper() for e in (exceptional_erps or [])}
+    out["Exceptional ERP"] = out[erp_col].str.upper().isin(exceptional_upper)
 
-    pf_wage = out[basic_col].clip(upper=pf_wage_cap) if apply_pf_cap else out[basic_col]
-    out["PF Wage"] = pf_wage
-    out["PF (Employee)"] = pf_wage * pf_employee_pct / 100
-    out["PF (Employer)"] = pf_wage * pf_employer_pct / 100
+    profile_cols = ["Branch", "Designation", "Employment Type", "Company Code", "Retention Applicable"]
+    if customize_dashboard is not None and not customize_dashboard.empty:
+        cd = customize_dashboard.copy()
+        cd["ERP"] = cd["ERP"].astype(str).str.strip()
+        cd = cd.drop_duplicates(subset=["ERP"], keep="last")
+        out = out.merge(cd[["ERP"] + profile_cols], left_on=erp_col, right_on="ERP", how="left")
+        if "ERP" in out.columns and out["ERP"].equals(out[erp_col]) is False:
+            out = out.drop(columns=["ERP"])
+    else:
+        for col in profile_cols:
+            out[col] = None
 
-    esic_applicable = out["Gross Salary"] <= esic_threshold
-    out["ESIC Applicable"] = esic_applicable
-    out["ESIC (Employee)"] = 0.0
-    out["ESIC (Employer)"] = 0.0
-    out.loc[esic_applicable, "ESIC (Employee)"] = (
-        out.loc[esic_applicable, "Gross Salary"] * esic_employee_pct / 100
-    )
-    out.loc[esic_applicable, "ESIC (Employer)"] = (
-        out.loc[esic_applicable, "Gross Salary"] * esic_employer_pct / 100
-    )
+    out["Retention Applicable"] = out["Retention Applicable"].fillna("No")
+    retention_yes = out["Retention Applicable"].astype(str).str.strip().str.lower() == "yes"
 
-    out["Total Employee Deductions"] = out["PF (Employee)"] + out["ESIC (Employee)"]
-    out["Net Pay (Employee Take-home)"] = out["Gross Salary"] - out["Total Employee Deductions"]
-    out["Total Employer Cost (CTC add-on)"] = out["PF (Employer)"] + out["ESIC (Employer)"]
+    applicable = retention_yes & (~out["Exceptional ERP"]) & out["Hired By This Month"]
+    out["Deduction Applicable"] = applicable
 
+    out["10% of Gross Cap"] = out[gross_col] * deduction_pct / 100
+    out["Deduction Amount"] = 0.0
+    if applicable.any():
+        out.loc[applicable, "Deduction Amount"] = out.loc[
+            applicable, ["10% of Gross Cap", net_pay_col]
+        ].min(axis=1)
+
+    def _status(row):
+        if not row["Hired By This Month"]:
+            return "Not Yet Hired"
+        if row["Exceptional ERP"]:
+            return "Exceptional ERP - Excluded"
+        if not row["Deduction Applicable"]:
+            return "Retention Not Applicable"
+        if row["Deduction Amount"] > 0:
+            return "Pending Release"
+        return "No Deduction"
+
+    out["Status"] = out.apply(_status, axis=1)
     return out
 
 
-def compute_gig_worker_billing(
-    df: pd.DataFrame,
-    amount_col: str,
-    tds_pct: float = 1.0,
-) -> pd.DataFrame:
-    """Gig / contract worker monthly billing:
-        TDS Amount     = amount * tds_pct%
-        Billing Amount = amount + TDS Amount   (TDS added on top per requirement)
+def consolidate_paysheet_months(monthly_results: list, erp_col: str = "ERP") -> tuple:
+    """Combines a list of per-month `compute_paysheet_deduction()` outputs
+    into:
+      - `combined`: every month's rows stacked together (the month-wise
+        detail table)
+      - `summary`: one row per ERP with total deduction accumulated across
+        all uploaded months, how many months were processed, and the most
+        recent Branch / Designation / Employment Type / Company Code /
+        Status on file for that employee.
 
-    This matches the stated requirement: '1% TDS to be added as monthly
-    billing amount'. If your actual policy instead grosses-up so the worker
-    nets a fixed amount after TDS deduction, use amount / (1 - tds_pct/100)
-    instead — flagged here as an assumption to confirm.
+    Returns (summary_df, combined_df). Both are empty DataFrames if
+    `monthly_results` is empty.
     """
-    out = df.copy()
-    out[amount_col] = coerce_numeric_column(out[amount_col], amount_col)
-    out["TDS Amount"] = out[amount_col] * tds_pct / 100
-    out["Monthly Billing Amount"] = out[amount_col] + out["TDS Amount"]
-    return out
+    if not monthly_results:
+        return pd.DataFrame(), pd.DataFrame()
 
+    combined = pd.concat(monthly_results, ignore_index=True)
+    combined["Paysheet Month"] = pd.to_datetime(combined["Paysheet Month"])
+    combined = combined.sort_values("Paysheet Month")
 
-# --------------------------------------------------------------------------
-# 4. Gross <-> In-Hand converters
-# --------------------------------------------------------------------------
+    summary = combined.groupby(erp_col).agg(
+        **{
+            "Branch": ("Branch", "last"),
+            "Designation": ("Designation", "last"),
+            "Employment Type": ("Employment Type", "last"),
+            "Company Code": ("Company Code", "last"),
+            "First Hire Date": ("First Hire Date", "first"),
+            "Months Processed": ("Paysheet Month", "nunique"),
+            "Total Deduction Accumulated": ("Deduction Amount", "sum"),
+            "Latest Status": ("Status", "last"),
+        }
+    ).reset_index()
 
-def solve_gross_for_net_fulltime(
-    target_net: float,
-    fixed_allowances: float = 0.0,
-    pf_wage_cap: float = 15000,
-    apply_pf_cap: bool = True,
-    pf_employee_pct: float = 12.0,
-    pf_employer_pct: float = 12.0,
-    esic_threshold: float = 21000,
-    esic_employee_pct: float = 0.75,
-    esic_employer_pct: float = 3.25,
-    tolerance: float = 1.0,
-    max_iterations: int = 100,
-) -> dict:
-    """Reverse calculation: given a target monthly in-hand (net take-home)
-    amount, finds the Basic Salary (and resulting Gross) that would produce
-    it, using bisection search.
-
-    This can't be solved with a plain formula because PF is capped at a
-    wage ceiling and ESIC only applies below a gross threshold (₹21,000
-    by default) — so Net(Gross) is a piecewise, not linear, function.
-    Bisection works because Net(Gross) is monotonically non-decreasing
-    (crossing the ESIC threshold only ever *removes* a deduction, which can
-    only increase net pay, never decrease it).
-
-    `fixed_allowances` = HRA + Other Allowances, treated as a fixed rupee
-    amount added on top of Basic for Gross, but NOT subject to PF (only
-    Basic is PF wage). Set to 0 if you want the entire amount to be Basic.
-    """
-
-    def net_for_basic(basic):
-        df = pd.DataFrame([{"Basic": basic, "Other": fixed_allowances}])
-        result = compute_fulltime_payroll(
-            df, "Basic", None, "Other",
-            pf_wage_cap=pf_wage_cap, apply_pf_cap=apply_pf_cap,
-            pf_employee_pct=pf_employee_pct, pf_employer_pct=pf_employer_pct,
-            esic_threshold=esic_threshold,
-            esic_employee_pct=esic_employee_pct, esic_employer_pct=esic_employer_pct,
-        )
-        return result.iloc[0]
-
-    low, high = 0.0, max(target_net * 2.0, target_net + 100000.0) + 100000.0
-    mid = low
-    row = net_for_basic(high)
-    if row["Net Pay (Employee Take-home)"] < target_net:
-        high *= 3  # safety expansion if target is unreachable within initial bound
-
-    for _ in range(max_iterations):
-        mid = (low + high) / 2
-        row = net_for_basic(mid)
-        net = row["Net Pay (Employee Take-home)"]
-        if abs(net - target_net) <= tolerance:
-            break
-        if net < target_net:
-            low = mid
-        else:
-            high = mid
-
-    final_row = net_for_basic(mid)
-    return {
-        "Basic": mid,
-        "Gross": final_row["Gross Salary"],
-        "row": final_row,
-    }
-
-
-def gig_inhand_to_billing(inhand_amount: float, tds_pct: float = 1.0) -> dict:
-    """Forward: worker's in-hand payment -> billing amount (Amount + TDS)."""
-    tds_amount = inhand_amount * tds_pct / 100
-    return {
-        "In-Hand Amount": inhand_amount,
-        "TDS Amount": tds_amount,
-        "Billing Amount": inhand_amount + tds_amount,
-    }
-
-
-def gig_billing_to_inhand(billing_amount: float, tds_pct: float = 1.0) -> dict:
-    """Reverse: known billing amount -> worker's in-hand payment.
-    Since Billing = Amount * (1 + tds%/100), Amount = Billing / (1 + tds%/100).
-    """
-    inhand = billing_amount / (1 + tds_pct / 100)
-    return {
-        "Billing Amount": billing_amount,
-        "TDS Amount": billing_amount - inhand,
-        "In-Hand Amount": inhand,
-    }
+    return summary.sort_values(erp_col).reset_index(drop=True), combined.reset_index(drop=True)
