@@ -44,6 +44,11 @@ safe_error_message = _u.safe_error_message
 render_clear_data_button = _u.render_clear_data_button
 pending_deduction_sentence = _u.pending_deduction_sentence
 
+load_ignored_company_codes = _u.load_ignored_company_codes
+save_ignored_company_codes = _u.save_ignored_company_codes
+sample_ignored_company_code_bulk_template = _u.sample_ignored_company_code_bulk_template
+merge_ignored_company_code_bulk_upload = _u.merge_ignored_company_code_bulk_upload
+
 load_exceptional_erps = _u.load_exceptional_erps
 save_exceptional_erps = _u.save_exceptional_erps
 sample_exceptional_erp_bulk_template = _u.sample_exceptional_erp_bulk_template
@@ -58,6 +63,7 @@ load_customize_dashboard = _u.load_customize_dashboard
 save_customize_dashboard = _u.save_customize_dashboard
 sample_customize_dashboard_bulk_template = _u.sample_customize_dashboard_bulk_template
 merge_customize_dashboard_bulk_upload = _u.merge_customize_dashboard_bulk_upload
+upsert_customize_dashboard_rule = _u.upsert_customize_dashboard_rule
 sample_consolidated_paysheet_template = _u.sample_consolidated_paysheet_template
 normalise_employee_master = _u.normalise_employee_master
 process_consolidated_paysheets = _u.process_consolidated_paysheets
@@ -70,14 +76,14 @@ render_top_nav("Retention Fund")
 st.title("💰 Retention Fund")
 st.caption(
     "Retention is calculated from the employee's First Hire Date month. "
-    "Employment Type is the first eligibility rule: Full Time = deduction eligible; "
-    "Gig Worker / Consultant = no deduction. Formula: min(10% of Monthly Gross, Net Pay)."
+    "The Customize Dashboard is the first eligibility checkpoint. Full Time + Retention Applicable = Yes "
+    "is eligible only when the Company Code and ERP are not excluded. Formula: min(10% of Monthly Gross, Net Pay)."
 )
 
 with st.expander("🔒 Data handling on this page", expanded=False):
     st.markdown(
         "- Paysheets are processed in the current Streamlit session.\n"
-        "- Customize Dashboard and Exceptional ERP settings are saved as admin configuration.\n"
+        "- Customize Dashboard, excluded Company Codes and Exceptional ERP settings are saved as admin configuration.\n"
         "- Downloaded Excel reports use the shared export sanitizer from util.py.\n"
         "- Use the button below when you want to clear cached payroll data from this session."
     )
@@ -190,6 +196,16 @@ def _download_report_pack(reports: dict, key: str, label: str = "⬇️ Download
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=key,
     )
+
+
+def _clear_retention_results():
+    """Clear only Retention Fund calculation outputs after a rule/exclusion change."""
+    for result_key in [
+        "consolidated_paysheet_summary",
+        "consolidated_paysheet_result",
+        "retention_reports",
+    ]:
+        st.session_state.pop(result_key, None)
 
 
 # ======================================================================
@@ -335,12 +351,14 @@ with tab_compute:
     st.divider()
     st.markdown("### Calculate Retention Fund")
     customize_rules = load_customize_dashboard()
+    ignored_company_codes = load_ignored_company_codes()
     exceptional_erps = load_exceptional_erps()
 
-    ready_c1, ready_c2, ready_c3 = st.columns(3)
+    ready_c1, ready_c2, ready_c3, ready_c4 = st.columns(4)
     ready_c1.metric("Customize Rules", len(customize_rules))
-    ready_c2.metric("Exceptional ERPs", len(exceptional_erps))
-    ready_c3.metric("Paysheet Months", len(batch))
+    ready_c2.metric("Excluded Company Codes", len(ignored_company_codes))
+    ready_c3.metric("Exceptional ERPs", len(exceptional_erps))
+    ready_c4.metric("Paysheet Months", len(batch))
 
     if customize_rules.empty:
         st.warning(
@@ -359,6 +377,7 @@ with tab_compute:
                     customize_dashboard=customize_rules,
                     employee_master=employee_master_raw,
                     deduction_pct=10.0,
+                    ignored_company_codes=ignored_company_codes,
                 )
                 reports = build_retention_reports(summary, combined)
 
@@ -405,6 +424,7 @@ with tab_compute:
                 c for c in [
                     "ERP", "Paysheet Month", "First Hire Date", "Branch", "Designation",
                     "Company Code", "Employment Type", "Retention Applicable",
+                    "Company Code Excluded", "Exceptional ERP",
                     "Monthly Gross", "Net Pay", "Deduction Amount", "Status",
                     "Final Retention Remark",
                 ] if c in pending_df.columns
@@ -433,57 +453,104 @@ with tab_compute:
 
 
 # ======================================================================
-# TAB 2 — CUSTOMIZE DASHBOARD + EXCEPTIONAL ERP MANAGEMENT
+# TAB 2 — CUSTOMIZE DASHBOARD
 # ======================================================================
 with tab_customize:
     st.markdown("### Customize Dashboard")
     st.caption(
-        "This is the first eligibility control for Retention Fund. Rules are matched using "
-        "Branch + Company Code + Designation. Employment Type is selected here and directly "
-        "determines whether retention is applicable."
+        "Configure who is eligible before running Retention Fund. A deduction is allowed only when the "
+        "employee is Full Time, Retention Applicable is Yes, the Company Code is not excluded, and the ERP "
+        "is not in the Exceptional ERP list."
     )
 
-    st.markdown("#### Retention Eligibility Logic")
-    logic_df = pd.DataFrame(
-        [
-            {"Employment Type": "Full Time", "Retention Applicable": "Yes", "Retention Remarks": "Retention Deduction Applicable - Full Time"},
-            {"Employment Type": "Gig Worker", "Retention Applicable": "No", "Retention Remarks": "No Deduction - Gig Worker"},
-            {"Employment Type": "Consultant", "Retention Applicable": "No", "Retention Remarks": "No Deduction - Consultant"},
-        ]
-    )
-    st.dataframe(logic_df, use_container_width=True, hide_index=True)
     st.info(
-        "Retention Applicable and Retention Remarks are automatically derived from Employment Type. "
-        "Only Employment Type needs to be selected; this prevents conflicting combinations such as "
-        "Gig Worker + Retention Applicable = Yes."
+        "**No deduction** when any one of these applies: Excluded Company Code • Exceptional ERP • "
+        "Non-Full Time • Retention Applicable = No."
     )
 
-    st.divider()
-    st.markdown("#### 1. Bulk Upload Customize Rules")
-    st.write(
-        "Bulk file columns: **Branch, Company Code, Designation** only. New combinations default to "
-        "**Full Time**, which automatically means **Retention Applicable = Yes**. You can change "
-        "Employment Type using the dropdown in the Rule Table."
+    # ------------------------------------------------------------------
+    # 1. Rule Master — individual add + bulk add + editable table
+    # ------------------------------------------------------------------
+    st.markdown("#### 1. Branch / Designation Rule Master")
+    st.caption(
+        "The rule key is **Branch + Company Code + Designation**. Bulk upload needs only these three fields. "
+        "Employment Type and Retention Applicable are automatically added and can be changed from dropdowns."
     )
 
-    customize_sample = sample_customize_dashboard_bulk_template()
-    st.dataframe(customize_sample, use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ Download Customize Bulk Template",
-        data=to_excel_bytes({"Template": customize_sample}),
-        file_name="customize_dashboard_bulk_template.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_customize_dashboard_template",
-    )
+    add_col, bulk_col = st.columns(2)
 
-    customize_file = st.file_uploader(
-        "Upload Customize Rules",
-        type=["xlsx", "xls", "csv"],
-        key="customize_rule_upload",
-    )
+    with add_col:
+        st.markdown("##### Add One Rule")
+        single_branch = st.text_input(
+            "Branch",
+            key="customize_single_branch",
+            placeholder="Example: Koramangala",
+        )
+        single_designation = st.text_input(
+            "Designation",
+            key="customize_single_designation",
+            placeholder="Example: Teacher",
+        )
+        single_company = st.text_input(
+            "Company Code",
+            key="customize_single_company_code",
+            placeholder="Example: MAIN",
+        )
+        single_employment = st.selectbox(
+            "Employment Type",
+            options=EMPLOYMENT_TYPE_OPTIONS,
+            index=0,
+            key="customize_single_employment_type",
+        )
+        single_retention = st.selectbox(
+            "Eligible for Retention",
+            options=RETENTION_APPLICABLE_OPTIONS,
+            index=0,
+            key="customize_single_retention_applicable",
+        )
 
-    if customize_file is not None:
-        if st.button("Upload / Merge Customize Rules", key="merge_customize_rules", type="primary"):
+        if st.button("➕ Add / Update Rule", key="customize_add_single_rule", type="primary"):
+            try:
+                updated = upsert_customize_dashboard_rule(
+                    existing_df=load_customize_dashboard(),
+                    branch=single_branch,
+                    designation=single_designation,
+                    company_code=single_company,
+                    employment_type=single_employment,
+                    retention_applicable=single_retention,
+                )
+                save_customize_dashboard(updated)
+                _clear_retention_results()
+                st.success("Rule added/updated successfully.")
+                st.rerun()
+            except Exception as exc:
+                _show_error(exc, "adding the Customize Dashboard rule")
+
+    with bulk_col:
+        st.markdown("##### Bulk Add Rules")
+        st.caption(
+            "Upload only **Branch, Company Code, Designation**. New rules automatically appear as "
+            "**Full Time / Yes** until you edit the dropdowns below. Existing rule choices are preserved."
+        )
+        customize_sample = sample_customize_dashboard_bulk_template()
+        st.download_button(
+            "⬇️ Download Rule Template",
+            data=to_excel_bytes({"Template": customize_sample}),
+            file_name="retention_customize_rules_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_customize_rule_template",
+        )
+        customize_file = st.file_uploader(
+            "Upload Branch / Company Code / Designation",
+            type=["xlsx", "xls", "csv"],
+            key="customize_bulk_rule_upload",
+        )
+
+        if customize_file is not None and st.button(
+            "Upload / Merge Rules",
+            key="customize_merge_bulk_rules",
+            type="primary",
+        ):
             try:
                 customize_file.seek(0)
                 uploaded_rules = read_any_table(customize_file)
@@ -499,7 +566,9 @@ with tab_customize:
                 if designation_col is None:
                     missing.append("Designation")
                 if missing:
-                    raise ValueError(f"Customize file is missing required column(s): {', '.join(missing)}")
+                    raise ValueError(
+                        f"Customize file is missing required column(s): {', '.join(missing)}"
+                    )
 
                 merged = merge_customize_dashboard_bulk_upload(
                     existing_df=load_customize_dashboard(),
@@ -509,19 +578,13 @@ with tab_customize:
                     designation_col=designation_col,
                 )
                 save_customize_dashboard(merged)
-                st.success(f"Customize Dashboard updated. Total active rules: {len(merged)}.")
+                _clear_retention_results()
+                st.success(f"Bulk upload completed. Total rules: {len(merged)}.")
                 st.rerun()
             except Exception as exc:
-                _show_error(exc, "processing Customize Dashboard rules")
+                _show_error(exc, "processing the Customize Dashboard bulk upload")
 
-    st.divider()
-    st.markdown("#### 2. Rule Table")
-    st.caption(
-        "Select Employment Type from the dropdown. Full Time is retention eligible; Gig Worker and "
-        "Consultant are automatically marked No Deduction. Retention Applicable and Retention Remarks "
-        "are read-only derived fields and refresh after Save."
-    )
-
+    st.markdown("##### Editable Rule Table")
     rules_df = load_customize_dashboard()
     if rules_df.empty:
         rules_df = pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
@@ -530,163 +593,238 @@ with tab_customize:
         rules_df,
         use_container_width=True,
         num_rows="dynamic",
-        key="customize_dashboard_editor",
-        disabled=["Retention Applicable", "Retention Remarks"],
+        key="customize_rule_table_editor",
+        column_order=[
+            "Branch",
+            "Designation",
+            "Company Code",
+            "Employment Type",
+            "Retention Applicable",
+        ],
         column_config={
             "Branch": st.column_config.TextColumn("Branch", required=True),
             "Designation": st.column_config.TextColumn("Designation", required=True),
+            "Company Code": st.column_config.TextColumn("Company Code", required=True),
             "Employment Type": st.column_config.SelectboxColumn(
                 "Employment Type",
                 options=EMPLOYMENT_TYPE_OPTIONS,
                 required=True,
-                help="Full Time = retention eligible; Gig Worker / Consultant = no deduction.",
+                help="Non-Full Time is always excluded from Retention Fund deduction.",
             ),
-            "Company Code": st.column_config.TextColumn("Company Code", required=True),
-            "Retention Applicable": st.column_config.TextColumn(
-                "Retention Applicable",
-                help="Automatically derived from Employment Type.",
-            ),
-            "Retention Remarks": st.column_config.TextColumn(
-                "Retention Remarks",
-                width="large",
-                help="Automatically derived from Employment Type.",
+            "Retention Applicable": st.column_config.SelectboxColumn(
+                "Eligible for Retention",
+                options=RETENTION_APPLICABLE_OPTIONS,
+                required=True,
+                help="Yes/No eligibility control. Non-Full Time remains excluded even if Yes is selected.",
             ),
         },
     )
 
-    if st.button("💾 Save Customize Dashboard", key="save_customize_dashboard", type="primary"):
+    save_c1, save_c2, save_c3, save_c4 = st.columns([2, 1, 1, 1])
+    if save_c1.button("💾 Save Rule Table", key="customize_save_rule_table", type="primary"):
         try:
             save_customize_dashboard(edited_rules)
-            st.success("Customize Dashboard saved and retention applicability refreshed from Employment Type.")
-            for result_key in [
-                "consolidated_paysheet_summary",
-                "consolidated_paysheet_result",
-                "retention_reports",
-            ]:
-                st.session_state.pop(result_key, None)
+            _clear_retention_results()
+            st.success("Customize Dashboard saved.")
             st.rerun()
         except Exception as exc:
-            _show_error(exc, "saving Customize Dashboard")
+            _show_error(exc, "saving the Customize Dashboard")
 
-    saved_rules = load_customize_dashboard()
-    if not saved_rules.empty:
-        e1, e2, e3 = st.columns(3)
-        e1.metric("Full Time Rules", int(saved_rules["Employment Type"].eq("Full Time").sum()))
-        e2.metric("Gig Worker Rules", int(saved_rules["Employment Type"].eq("Gig Worker").sum()))
-        e3.metric("Consultant Rules", int(saved_rules["Employment Type"].eq("Consultant").sum()))
+    current_rules = load_customize_dashboard()
+    if not current_rules.empty:
+        save_c2.metric("Rules", len(current_rules))
+        save_c3.metric(
+            "Full Time",
+            int(current_rules["Employment Type"].eq("Full Time").sum()),
+        )
+        save_c4.metric(
+            "Non-Full Time",
+            int(current_rules["Employment Type"].eq("Non-Full Time").sum()),
+        )
 
     st.divider()
-    st.markdown("#### 3. Exceptional ERP Exclusions")
+
+    # ------------------------------------------------------------------
+    # 2. Hard exclusions — Company Code + ERP
+    # ------------------------------------------------------------------
+    st.markdown("#### 2. Deduction Exclusions")
     st.caption(
-        "Exceptional ERPs are managed on this same Customize Dashboard page. Any ERP in this list gets "
-        "no retention deduction even when its matched rule is Full Time / Retention Applicable = Yes."
+        "These are hard exclusions. They override the rule table: an employee gets ₹0 deduction when the "
+        "Company Code is excluded or the ERP is listed as Exceptional."
     )
 
-    exceptional = load_exceptional_erps()
-    ex_c1, ex_c2 = st.columns([3, 2])
+    company_col_ui, erp_col_ui = st.columns(2)
 
-    with ex_c1:
-        st.markdown("##### Bulk Upload Exceptional ERPs")
-        exceptional_sample = sample_exceptional_erp_bulk_template()
-        st.dataframe(exceptional_sample, use_container_width=True, hide_index=True)
+    # -------------------- Excluded Company Codes ----------------------
+    with company_col_ui:
+        st.markdown("##### Excluded Company Codes")
+        ignored_codes = load_ignored_company_codes()
+
+        if ignored_codes:
+            st.dataframe(
+                pd.DataFrame({"Company Code": ignored_codes}),
+                use_container_width=True,
+                hide_index=True,
+                height=170,
+            )
+        else:
+            st.info("No Company Codes are excluded.")
+
+        company_code_input = st.text_input(
+            "Add one Company Code",
+            key="excluded_company_code_manual_input",
+            placeholder="Example: IGNITE",
+        )
+        if st.button("Add Company Code", key="excluded_company_code_manual_add"):
+            code = company_code_input.strip().upper()
+            if not code:
+                st.warning("Enter a Company Code first.")
+            elif code in ignored_codes:
+                st.warning(f"{code} is already excluded.")
+            else:
+                save_ignored_company_codes(ignored_codes + [code])
+                _clear_retention_results()
+                st.success(f"{code} added to the no-deduction Company Code list.")
+                st.rerun()
+
+        company_sample = sample_ignored_company_code_bulk_template()
         st.download_button(
-            "⬇️ Download Exceptional ERP Template",
-            data=to_excel_bytes({"Template": exceptional_sample}),
-            file_name="exceptional_erp_bulk_template.xlsx",
+            "⬇️ Company Code Bulk Template",
+            data=to_excel_bytes({"Template": company_sample}),
+            file_name="retention_excluded_company_codes_template.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_exceptional_erp_template_customize",
+            key="download_excluded_company_code_template",
         )
-        exceptional_file = st.file_uploader(
-            "Upload Exceptional ERP List",
+        company_file = st.file_uploader(
+            "Bulk upload Company Codes",
             type=["xlsx", "xls", "csv"],
-            key="exceptional_erp_bulk_upload_customize",
-            help="Required column: ERP",
+            key="excluded_company_code_bulk_upload",
         )
-        if exceptional_file is not None and st.button(
-            "Upload / Merge Exceptional ERPs",
-            key="merge_exceptional_erps_customize",
-            type="primary",
+        if company_file is not None and st.button(
+            "Merge Company Codes",
+            key="merge_excluded_company_codes",
         ):
             try:
-                exceptional_file.seek(0)
-                exceptional_upload_df = read_any_table(exceptional_file)
-                erp_col = auto_detect_column(
-                    exceptional_upload_df,
-                    ["erp", "employee id", "employee code", "emp code"],
+                company_file.seek(0)
+                company_df = read_any_table(company_file)
+                cc_col = auto_detect_column(company_df, ["company code", "company", "cc"])
+                if cc_col is None:
+                    raise ValueError("Company Code file must contain a Company Code column.")
+                merged_codes = merge_ignored_company_code_bulk_upload(
+                    ignored_codes,
+                    company_df,
+                    company_code_col=cc_col,
                 )
-                if erp_col is None:
-                    raise ValueError("Exceptional ERP file must contain an ERP column.")
-                merged_erps = merge_exceptional_erp_bulk_upload(
-                    exceptional, exceptional_upload_df, erp_col=erp_col
-                )
-                save_exceptional_erps(merged_erps)
-                for result_key in [
-                    "consolidated_paysheet_summary",
-                    "consolidated_paysheet_result",
-                    "retention_reports",
-                ]:
-                    st.session_state.pop(result_key, None)
-                st.success(
-                    f"Exceptional ERP list updated. {len(merged_erps)} ERP(s) are now excluded from deduction."
-                )
+                save_ignored_company_codes(merged_codes)
+                _clear_retention_results()
+                st.success(f"Excluded Company Code list updated. Total: {len(merged_codes)}.")
                 st.rerun()
             except Exception as exc:
-                _show_error(exc, "processing Exceptional ERP bulk upload")
+                _show_error(exc, "processing the excluded Company Code upload")
 
-    with ex_c2:
-        st.markdown("##### Current Exceptional ERPs")
+        if ignored_codes:
+            remove_company = st.selectbox(
+                "Remove Company Code",
+                options=[""] + ignored_codes,
+                key="excluded_company_code_remove_select",
+            )
+            if st.button("Remove Selected Company Code", key="excluded_company_code_remove_button"):
+                if not remove_company:
+                    st.warning("Select a Company Code first.")
+                else:
+                    save_ignored_company_codes(
+                        [code for code in ignored_codes if code != remove_company]
+                    )
+                    _clear_retention_results()
+                    st.success(f"{remove_company} removed from the exclusion list.")
+                    st.rerun()
+
+    # ------------------------ Exceptional ERPs ------------------------
+    with erp_col_ui:
+        st.markdown("##### Exceptional ERPs")
+        exceptional = load_exceptional_erps()
+
         if exceptional:
             st.dataframe(
                 pd.DataFrame({"ERP": exceptional}),
                 use_container_width=True,
                 hide_index=True,
-                height=220,
+                height=170,
             )
         else:
-            st.info("No exceptional ERPs configured.")
+            st.info("No Exceptional ERPs are configured.")
 
-        new_exceptional_erp = st.text_input(
-            "Add one ERP manually",
-            key="new_exceptional_erp_customize",
+        exceptional_input = st.text_input(
+            "Add one Exceptional ERP",
+            key="exceptional_erp_manual_input",
             placeholder="Example: ERP00123",
         )
-        if st.button("Add ERP", key="add_exceptional_erp_customize"):
-            erp = new_exceptional_erp.strip().upper()
+        if st.button("Add Exceptional ERP", key="exceptional_erp_manual_add"):
+            erp = exceptional_input.strip().upper()
             if not erp:
                 st.warning("Enter an ERP first.")
             elif erp in exceptional:
-                st.warning(f"{erp} is already in the exceptional list.")
+                st.warning(f"{erp} is already exceptional.")
             else:
                 save_exceptional_erps(exceptional + [erp])
-                for result_key in [
-                    "consolidated_paysheet_summary",
-                    "consolidated_paysheet_result",
-                    "retention_reports",
-                ]:
-                    st.session_state.pop(result_key, None)
-                st.success(f"{erp} added as an exceptional ERP.")
+                _clear_retention_results()
+                st.success(f"{erp} added to the no-deduction ERP list.")
                 st.rerun()
+
+        exceptional_sample = sample_exceptional_erp_bulk_template()
+        st.download_button(
+            "⬇️ Exceptional ERP Bulk Template",
+            data=to_excel_bytes({"Template": exceptional_sample}),
+            file_name="retention_exceptional_erp_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_exceptional_erp_template",
+        )
+        exceptional_file = st.file_uploader(
+            "Bulk upload Exceptional ERPs",
+            type=["xlsx", "xls", "csv"],
+            key="exceptional_erp_bulk_upload",
+        )
+        if exceptional_file is not None and st.button(
+            "Merge Exceptional ERPs",
+            key="merge_exceptional_erps",
+        ):
+            try:
+                exceptional_file.seek(0)
+                exceptional_df = read_any_table(exceptional_file)
+                erp_col = auto_detect_column(
+                    exceptional_df,
+                    ["erp", "employee id", "employee code", "emp code"],
+                )
+                if erp_col is None:
+                    raise ValueError("Exceptional ERP file must contain an ERP column.")
+                merged_erps = merge_exceptional_erp_bulk_upload(
+                    exceptional,
+                    exceptional_df,
+                    erp_col=erp_col,
+                )
+                save_exceptional_erps(merged_erps)
+                _clear_retention_results()
+                st.success(f"Exceptional ERP list updated. Total: {len(merged_erps)}.")
+                st.rerun()
+            except Exception as exc:
+                _show_error(exc, "processing the Exceptional ERP upload")
 
         if exceptional:
             remove_erp = st.selectbox(
-                "Remove an ERP",
+                "Remove Exceptional ERP",
                 options=[""] + exceptional,
-                key="remove_exceptional_erp_select_customize",
+                key="exceptional_erp_remove_select",
             )
-            if st.button("Remove Selected ERP", key="remove_exceptional_erp_customize"):
+            if st.button("Remove Selected ERP", key="exceptional_erp_remove_button"):
                 if not remove_erp:
                     st.warning("Select an ERP first.")
                 else:
-                    save_exceptional_erps([erp for erp in exceptional if erp != remove_erp])
-                    for result_key in [
-                        "consolidated_paysheet_summary",
-                        "consolidated_paysheet_result",
-                        "retention_reports",
-                    ]:
-                        st.session_state.pop(result_key, None)
-                    st.success(f"{remove_erp} removed from the exceptional ERP list.")
+                    save_exceptional_erps(
+                        [erp for erp in exceptional if erp != remove_erp]
+                    )
+                    _clear_retention_results()
+                    st.success(f"{remove_erp} removed from the Exceptional ERP list.")
                     st.rerun()
-
 
 # ======================================================================
 # TAB 3 — ANALYTICS DASHBOARD
@@ -706,6 +844,8 @@ with tab_dashboard:
         total_retention = float(summary["Total Deduction Accumulated"].sum())
         employees_with_deduction = int((summary["Total Deduction Accumulated"] > 0).sum())
         exceptional_rows = int(combined["Exceptional ERP"].fillna(False).sum())
+        excluded_company_rows = int(combined["Company Code Excluded"].fillna(False).sum()) if "Company Code Excluded" in combined.columns else 0
+        non_full_time_rows = int(combined["Employment Type"].fillna("").astype(str).eq("Non-Full Time").sum()) if "Employment Type" in combined.columns else 0
         missing_mapping_rows = int(combined["Employee Master Mapping Missing"].fillna(False).sum())
 
         k1, k2, k3, k4 = st.columns(4)
@@ -714,9 +854,11 @@ with tab_dashboard:
         k3.metric("Total Retention Fund", f"₹{total_retention:,.2f}")
         k4.metric("Months Covered", combined["Paysheet Month"].nunique())
 
-        q1, q2 = st.columns(2)
-        q1.metric("Exceptional ERP Rows", exceptional_rows)
-        q2.metric("Missing Mapping Rows", missing_mapping_rows)
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Excluded Company Code Rows", excluded_company_rows)
+        q2.metric("Exceptional ERP Rows", exceptional_rows)
+        q3.metric("Non-Full Time Rows", non_full_time_rows)
+        q4.metric("Missing Mapping Rows", missing_mapping_rows)
 
         monthly_summary = reports.get("Monthly Summary", pd.DataFrame())
         if isinstance(monthly_summary, pd.DataFrame) and not monthly_summary.empty:
@@ -733,6 +875,7 @@ with tab_dashboard:
                 "Employment Type",
                 "Retention Remarks",
                 "Status",
+                "Exclusions",
                 "Missing Mapping",
                 "First Hire Audit",
             ]
@@ -744,6 +887,7 @@ with tab_dashboard:
             "Employment Type Summary",
             "Retention Remarks Summary",
             "Status Summary",
+            "Exclusion Summary",
             "Missing Mapping",
             "First Hire Date Audit",
         ]
