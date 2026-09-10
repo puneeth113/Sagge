@@ -7,7 +7,6 @@ each page) makes the app easier to maintain and test.
 import io
 import os
 import json
-import re
 from datetime import date, datetime
 import pandas as pd
 import streamlit as st
@@ -279,22 +278,34 @@ DEFAULT_ABSENCE_THRESHOLDS = [
 ]
 
 
+
 # --------------------------------------------------------------------------
 # 2. Retention Fund — First Hire Date based design
 # --------------------------------------------------------------------------
-# Business rules implemented here:
+# IMPORTANT: Everything above this section is preserved from the existing
+# util.py. The helpers below are retention-specific and intentionally keep
+# the older public function names where practical so existing imports do not
+# break.
+#
+# Retention rules:
 #   * No Internal Transfer logic.
-#   * First Hire Date (not Joining Date) controls the first deduction month.
-#   * Deduction starts in the First Hire Date calendar month.
+#   * First Hire Date is the only hire-date basis.
+#   * The First Hire Date calendar month itself is eligible.
 #   * Deduction = min(10% of Monthly Gross, Net Pay).
-#   * Customize Dashboard is a rule table keyed by Branch + Company Code +
-#     Designation. Employment Type and Retention Applicable are dropdowns.
-#   * Exceptional ERPs are hard exclusions and override every other rule.
-#   * Monthly paysheets can be processed together and reported in a single
-#     consolidated output.
+#   * Customize Dashboard rules are keyed by Branch + Company Code +
+#     Designation and provide Employment Type + Retention Applicable.
+#   * Exceptional ERPs are hard exclusions.
+#   * Consolidated processing supports multiple monthly paysheets.
+
+# The ignored-company-code helpers are retained for backward compatibility
+# with any older page/module that may import them. The NEW retention compute
+# does not use this list; eligibility is controlled by Customize Dashboard
+# plus Exceptional ERP exclusions.
+DEFAULT_IGNORED_COMPANY_CODES = ["IGNITE"]
 
 _APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.path.join(_APP_ROOT, "..", "data")
+_IGNORED_CC_FILE = os.path.join(_DATA_DIR, "ignored_company_codes.json")
 _EXCEPTIONAL_ERP_FILE = os.path.join(_DATA_DIR, "exceptional_erps.json")
 _CUSTOMIZE_DASHBOARD_FILE = os.path.join(_DATA_DIR, "customize_dashboard.json")
 
@@ -314,78 +325,103 @@ CONSOLIDATED_PAYSHEET_COLUMNS = ["ERP", "First Hire Date", "Net Pay", "Monthly G
 EMPLOYEE_MASTER_COLUMNS = ["ERP", "Branch", "Designation", "Company Code"]
 
 
-def _clean_text(value) -> str:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+def _retention_clean_text(value) -> str:
+    if value is None:
         return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
     return str(value).strip()
 
 
-def _normalise_key_series(series: pd.Series) -> pd.Series:
+def _retention_normalise_key_series(series: pd.Series) -> pd.Series:
     return series.fillna("").astype(str).str.strip().str.upper()
 
 
+# --------------------------------------------------------------------------
+# Compatibility: ignored company code settings (not used by new compute)
+# --------------------------------------------------------------------------
+
+def load_ignored_company_codes() -> list:
+    """Return legacy ignored Company Codes for backward compatibility."""
+    if not os.path.exists(_IGNORED_CC_FILE):
+        return list(DEFAULT_IGNORED_COMPANY_CODES)
+    try:
+        with open(_IGNORED_CC_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list) and all(isinstance(c, str) for c in data):
+            return data
+    except Exception:
+        pass
+    return list(DEFAULT_IGNORED_COMPANY_CODES)
+
+
+def save_ignored_company_codes(codes: list):
+    """Persist legacy ignored Company Codes for backward compatibility."""
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    clean = sorted({str(c).strip().upper() for c in codes if str(c).strip()})
+    with open(_IGNORED_CC_FILE, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2)
+
+
+# --------------------------------------------------------------------------
+# Exceptional ERP exclusions
+# --------------------------------------------------------------------------
+
 def load_exceptional_erps() -> list:
-    """Load ERPs that must never have Retention Fund deducted."""
+    """Return ERPs that must never have Retention Fund deducted."""
     if not os.path.exists(_EXCEPTIONAL_ERP_FILE):
         return []
     try:
         with open(_EXCEPTIONAL_ERP_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, list):
-            return sorted({_clean_text(v).upper() for v in data if _clean_text(v)})
+            return sorted({_retention_clean_text(v).upper() for v in data if _retention_clean_text(v)})
     except Exception:
         pass
     return []
 
 
 def save_exceptional_erps(erps: list):
-    """Persist the exceptional ERP list."""
+    """Persist exceptional ERP exclusions."""
     os.makedirs(_DATA_DIR, exist_ok=True)
-    clean = sorted({_clean_text(v).upper() for v in erps if _clean_text(v)})
+    clean = sorted({_retention_clean_text(v).upper() for v in erps if _retention_clean_text(v)})
     with open(_EXCEPTIONAL_ERP_FILE, "w", encoding="utf-8") as f:
         json.dump(clean, f, indent=2)
 
 
-def load_customize_dashboard() -> pd.DataFrame:
-    """Load Branch + Company Code + Designation retention rules.
-
-    Older saved files may contain ERP because the previous design stored one
-    rule per employee. ERP is intentionally discarded during migration and
-    duplicate rule keys are collapsed using the last saved row.
-    """
-    if not os.path.exists(_CUSTOMIZE_DASHBOARD_FILE):
-        return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
-    try:
-        with open(_CUSTOMIZE_DASHBOARD_FILE, "r", encoding="utf-8") as f:
-            records = json.load(f)
-        df = pd.DataFrame(records)
-        for col in CUSTOMIZE_DASHBOARD_COLUMNS:
-            if col not in df.columns:
-                df[col] = None
-        df = df[CUSTOMIZE_DASHBOARD_COLUMNS].copy()
-        return _prepare_customize_dashboard(df)
-    except Exception:
-        return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
-
+# --------------------------------------------------------------------------
+# Customize Dashboard — Branch + Company Code + Designation rule table
+# --------------------------------------------------------------------------
 
 def _prepare_customize_dashboard(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate/normalise the rule table without changing its business data."""
+    if df is None:
+        df = pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
+
     out = df.copy()
     for col in CUSTOMIZE_DASHBOARD_COLUMNS:
         if col not in out.columns:
             out[col] = None
 
     for col in ["Branch", "Designation", "Company Code"]:
-        out[col] = out[col].apply(_clean_text)
+        out[col] = out[col].apply(_retention_clean_text)
 
-    out["Employment Type"] = out["Employment Type"].apply(_clean_text).replace("", "Full Time")
-    out["Retention Applicable"] = out["Retention Applicable"].apply(_clean_text).replace("", "Yes")
+    out["Employment Type"] = out["Employment Type"].apply(_retention_clean_text)
+    out["Retention Applicable"] = out["Retention Applicable"].apply(_retention_clean_text)
 
-    # Keep only supported dropdown values; unknown legacy values become the
-    # safe defaults so the user can correct them in the dashboard.
+    # New rows default to Full Time / Yes. Users can immediately change both
+    # fields through dropdowns in retention.py.
+    out.loc[out["Employment Type"].eq(""), "Employment Type"] = "Full Time"
+    out.loc[out["Retention Applicable"].eq(""), "Retention Applicable"] = "Yes"
+
+    # Invalid legacy values are kept safe rather than used as a deduction rule.
     out.loc[~out["Employment Type"].isin(EMPLOYMENT_TYPE_OPTIONS), "Employment Type"] = "Full Time"
-    out.loc[~out["Retention Applicable"].isin(RETENTION_APPLICABLE_OPTIONS), "Retention Applicable"] = "Yes"
+    out.loc[~out["Retention Applicable"].isin(RETENTION_APPLICABLE_OPTIONS), "Retention Applicable"] = "No"
 
-    # A rule without all three key fields cannot be matched reliably.
+    # A match requires all three rule keys.
     valid = (
         out["Branch"].ne("")
         & out["Company Code"].ne("")
@@ -393,16 +429,38 @@ def _prepare_customize_dashboard(df: pd.DataFrame) -> pd.DataFrame:
     )
     out = out.loc[valid, CUSTOMIZE_DASHBOARD_COLUMNS].copy()
 
-    # Dedupe case-insensitively while retaining display casing from the last row.
-    out["__branch_key"] = _normalise_key_series(out["Branch"])
-    out["__cc_key"] = _normalise_key_series(out["Company Code"])
-    out["__desig_key"] = _normalise_key_series(out["Designation"])
-    out = out.drop_duplicates(["__branch_key", "__cc_key", "__desig_key"], keep="last")
-    return out.drop(columns=["__branch_key", "__cc_key", "__desig_key"]).reset_index(drop=True)
+    if out.empty:
+        return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
+
+    out["__branch_key"] = _retention_normalise_key_series(out["Branch"])
+    out["__cc_key"] = _retention_normalise_key_series(out["Company Code"])
+    out["__designation_key"] = _retention_normalise_key_series(out["Designation"])
+    out = out.drop_duplicates(
+        subset=["__branch_key", "__cc_key", "__designation_key"],
+        keep="last",
+    )
+    out = out.drop(columns=["__branch_key", "__cc_key", "__designation_key"])
+    return out.reset_index(drop=True)
+
+
+def load_customize_dashboard() -> pd.DataFrame:
+    """Load retention rules.
+
+    If an older saved JSON contains ERP-level rows, ERP is ignored and rows
+    are migrated into Branch + Company Code + Designation rules.
+    """
+    if not os.path.exists(_CUSTOMIZE_DASHBOARD_FILE):
+        return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
+    try:
+        with open(_CUSTOMIZE_DASHBOARD_FILE, "r", encoding="utf-8") as f:
+            records = json.load(f)
+        return _prepare_customize_dashboard(pd.DataFrame(records))
+    except Exception:
+        return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
 
 
 def save_customize_dashboard(df: pd.DataFrame):
-    """Persist Customize Dashboard rules."""
+    """Persist the Customize Dashboard rule table."""
     os.makedirs(_DATA_DIR, exist_ok=True)
     out = _prepare_customize_dashboard(df)
     with open(_CUSTOMIZE_DASHBOARD_FILE, "w", encoding="utf-8") as f:
@@ -410,12 +468,7 @@ def save_customize_dashboard(df: pd.DataFrame):
 
 
 def sample_customize_dashboard_bulk_template() -> pd.DataFrame:
-    """Template requested for Customize Dashboard bulk upload.
-
-    The upload contains only Branch, Company Code and Designation. The two
-    remaining fields appear in the app as dropdowns and default to Full Time
-    and Yes for a new rule.
-    """
+    """Bulk-upload format: only Branch, Company Code and Designation."""
     return pd.DataFrame(
         [
             {"Branch": "Koramangala", "Company Code": "MAIN", "Designation": "Teacher"},
@@ -427,16 +480,16 @@ def sample_customize_dashboard_bulk_template() -> pd.DataFrame:
 def merge_customize_dashboard_bulk_upload(
     existing_df: pd.DataFrame,
     upload_df: pd.DataFrame,
-    erp_col: str = None,  # kept only for backward compatibility; intentionally ignored
+    erp_col: str = None,
     branch_col: str = "Branch",
     cc_col: str = "Company Code",
     designation_col: str = "Designation",
 ) -> pd.DataFrame:
-    """Merge a 3-column Customize Dashboard bulk upload into saved rules.
+    """Merge a three-column bulk upload into saved Customize rules.
 
-    Existing Employment Type / Retention Applicable selections are retained
-    when the same Branch + Company Code + Designation is uploaded again.
-    New rules default to Full Time / Yes and can be changed via dropdowns.
+    `erp_col` is intentionally retained in the signature only for compatibility
+    with older callers. It is no longer used because the Customize Dashboard
+    is a rule table, not an ERP-level table.
     """
     required = [branch_col, cc_col, designation_col]
     missing = [c for c in required if c not in upload_df.columns]
@@ -447,63 +500,62 @@ def merge_customize_dashboard_bulk_upload(
     existing_map = {}
     for _, row in existing.iterrows():
         key = (
-            _clean_text(row["Branch"]).upper(),
-            _clean_text(row["Company Code"]).upper(),
-            _clean_text(row["Designation"]).upper(),
+            _retention_clean_text(row["Branch"]).upper(),
+            _retention_clean_text(row["Company Code"]).upper(),
+            _retention_clean_text(row["Designation"]).upper(),
         )
         existing_map[key] = row.to_dict()
 
     rows = []
     for _, row in upload_df.iterrows():
-        branch = _clean_text(row.get(branch_col))
-        cc = _clean_text(row.get(cc_col))
-        desig = _clean_text(row.get(designation_col))
-        if not branch or not cc or not desig:
+        branch = _retention_clean_text(row.get(branch_col))
+        company_code = _retention_clean_text(row.get(cc_col))
+        designation = _retention_clean_text(row.get(designation_col))
+        if not branch or not company_code or not designation:
             continue
 
-        key = (branch.upper(), cc.upper(), desig.upper())
+        key = (branch.upper(), company_code.upper(), designation.upper())
         prior = existing_map.get(key, {})
         rows.append(
             {
                 "Branch": branch,
-                "Designation": desig,
-                "Employment Type": prior.get("Employment Type", "Full Time"),
-                "Company Code": cc,
-                "Retention Applicable": prior.get("Retention Applicable", "Yes"),
+                "Designation": designation,
+                "Employment Type": prior.get("Employment Type") or "Full Time",
+                "Company Code": company_code,
+                "Retention Applicable": prior.get("Retention Applicable") or "Yes",
             }
         )
 
-    uploaded_rules = pd.DataFrame(rows, columns=CUSTOMIZE_DASHBOARD_COLUMNS)
-    if uploaded_rules.empty:
+    uploaded = pd.DataFrame(rows, columns=CUSTOMIZE_DASHBOARD_COLUMNS)
+    if uploaded.empty:
         return existing
 
-    # Replace matching keys and preserve rules not included in this upload.
-    old = existing.copy()
-    old["__key"] = list(
-        zip(
-            _normalise_key_series(old["Branch"]),
-            _normalise_key_series(old["Company Code"]),
-            _normalise_key_series(old["Designation"]),
+    def add_key(frame):
+        frame = frame.copy()
+        frame["__key"] = list(
+            zip(
+                _retention_normalise_key_series(frame["Branch"]),
+                _retention_normalise_key_series(frame["Company Code"]),
+                _retention_normalise_key_series(frame["Designation"]),
+            )
         )
-    )
-    uploaded_rules["__key"] = list(
-        zip(
-            _normalise_key_series(uploaded_rules["Branch"]),
-            _normalise_key_series(uploaded_rules["Company Code"]),
-            _normalise_key_series(uploaded_rules["Designation"]),
-        )
-    )
-    untouched = old.loc[~old["__key"].isin(set(uploaded_rules["__key"]))].drop(columns="__key")
-    uploaded_rules = uploaded_rules.drop(columns="__key")
-    return _prepare_customize_dashboard(pd.concat([untouched, uploaded_rules], ignore_index=True))
+        return frame
+
+    old = add_key(existing)
+    new = add_key(uploaded)
+    new_keys = set(new["__key"].tolist())
+    untouched = old.loc[~old["__key"].isin(new_keys)].drop(columns="__key")
+    new = new.drop(columns="__key")
+    return _prepare_customize_dashboard(pd.concat([untouched, new], ignore_index=True))
 
 
 # --------------------------------------------------------------------------
-# Payroll cycle helper — retained for other app modules only.
-# Retention Fund itself DOES NOT use joining date / internal transfer cycle.
+# Payroll cycle helper — preserved for compatibility with any other modules.
+# Retention Fund itself does NOT use this helper for eligibility.
 # --------------------------------------------------------------------------
 
 def get_payroll_cycle(reference_date=None) -> tuple:
+    """Returns (cycle_start, cycle_end) for the 26th -> 25th payroll cycle."""
     if reference_date is None:
         reference_date = date.today()
     if isinstance(reference_date, datetime):
@@ -525,10 +577,12 @@ def get_payroll_cycle(reference_date=None) -> tuple:
             start_year -= 1
         cycle_start = date(start_year, start_month, 26)
         cycle_end = date(reference_date.year, reference_date.month, 25)
+
     return cycle_start, cycle_end
 
 
 def format_date_ddmmmyyyy(value) -> str:
+    """Format a date-like value as dd-mmm-yyyy; blank for invalid values."""
     if value is None:
         return ""
     try:
@@ -543,6 +597,7 @@ def format_date_ddmmmyyyy(value) -> str:
 
 
 def pending_deduction_sentence(label: str, pending_df: pd.DataFrame, name_col: str) -> str:
+    """Human-readable pending deduction summary."""
     count = len(pending_df)
     if count == 0:
         return f"**{label}**: No deductions pending."
@@ -553,10 +608,11 @@ def pending_deduction_sentence(label: str, pending_df: pd.DataFrame, name_col: s
 
 
 # --------------------------------------------------------------------------
-# Numeric coercion (shared by payroll + retention calculations)
+# Numeric coercion (same public helper name retained)
 # --------------------------------------------------------------------------
 
 def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.Series:
+    """Clean currency/text-formatted numeric columns and validate bad cells."""
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
 
@@ -564,19 +620,25 @@ def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.S
     cleaned = cleaned.replace({"": None, "nan": None, "None": None, "NaT": None})
     numeric = pd.to_numeric(cleaned, errors="coerce")
 
-    bad_mask = numeric.isna() & series.notna() & series.astype(str).str.strip().ne("")
+    original_nonblank = series.notna() & series.astype(str).str.strip().ne("")
+    bad_mask = numeric.isna() & original_nonblank
     if bad_mask.any():
         bad_rows = series[bad_mask]
         examples = ", ".join(f"row {i + 2}: '{v}'" for i, v in bad_rows.head(5).items())
         more = f" (+{bad_mask.sum() - 5} more)" if bad_mask.sum() > 5 else ""
         raise ValueError(
-            f"Column '{column_name}' has {bad_mask.sum()} invalid numeric value(s) — {examples}{more}."
+            f"Column '{column_name}' has {bad_mask.sum()} value(s) that are not valid numbers — "
+            f"e.g. {examples}{more}. Please fix these cells and re-upload."
         )
     return numeric
 
 
+# --------------------------------------------------------------------------
+# Consolidated Paysheet templates / employee-master enrichment
+# --------------------------------------------------------------------------
+
 def sample_consolidated_paysheet_template() -> pd.DataFrame:
-    """Required sample format for each monthly paysheet."""
+    """Required monthly paysheet format."""
     return pd.DataFrame(
         [
             {"ERP": "E001", "First Hire Date": "2020-01-15", "Net Pay": 21000, "Monthly Gross": 25000},
@@ -586,113 +648,148 @@ def sample_consolidated_paysheet_template() -> pd.DataFrame:
     )
 
 
-def _resolve_column(df: pd.DataFrame, aliases: list) -> str | None:
-    lookup = {str(c).strip().lower(): c for c in df.columns}
+def _retention_resolve_column(df: pd.DataFrame, aliases: list):
+    """Resolve a column using exact normalised aliases first, then substring aliases."""
+    if df is None or df.empty:
+        return None
+
+    normalized = {str(c).strip().lower(): c for c in df.columns}
     for alias in aliases:
-        if alias.lower() in lookup:
-            return lookup[alias.lower()]
+        key = str(alias).strip().lower()
+        if key in normalized:
+            return normalized[key]
+
+    for col in df.columns:
+        col_key = str(col).strip().lower()
+        for alias in aliases:
+            alias_key = str(alias).strip().lower()
+            if alias_key and alias_key in col_key:
+                return col
     return None
 
 
-def normalise_employee_master(employee_master: pd.DataFrame | None) -> pd.DataFrame:
-    """Convert the app's Employee Database into the 4 columns needed to map
-    an ERP to the Customize Dashboard rule.
+def normalise_employee_master(employee_master: pd.DataFrame = None) -> pd.DataFrame:
+    """Map the app's Employee Database to ERP/Branch/Designation/Company Code.
+
+    This allows the four-column paysheet to remain financial-only while the
+    system automatically obtains the employee's organizational attributes.
     """
     if employee_master is None or employee_master.empty:
         return pd.DataFrame(columns=EMPLOYEE_MASTER_COLUMNS)
 
     aliases = {
-        "ERP": ["ERP", "Employee ID", "Employee Code", "Emp Code", "EmployeeCode"],
-        "Branch": ["Branch", "Current Branch", "Curr.Branch", "Curr Branch", "Location"],
-        "Designation": ["Designation", "Current Designation", "Curr.Designation", "Curr Designation"],
-        "Company Code": ["Company Code", "CompanyCode", "Comp Code", "Company"],
+        "ERP": [
+            "ERP", "Employee ID", "Employee Id", "Employee Code", "Emp Code",
+            "EmployeeCode", "Emp ID", "ERP Code",
+        ],
+        "Branch": [
+            "Branch", "Current Branch", "Curr.Branch", "Curr Branch", "Branch Name",
+            "Location", "Current Location",
+        ],
+        "Designation": [
+            "Designation", "Current Designation", "Curr.Designation", "Curr Designation",
+            "Role", "Job Title", "Position",
+        ],
+        "Company Code": [
+            "Company Code", "CompanyCode", "Comp Code", "Company", "Company_Code",
+            "Entity Code",
+        ],
     }
-    resolved = {name: _resolve_column(employee_master, opts) for name, opts in aliases.items()}
+
+    resolved = {name: _retention_resolve_column(employee_master, options) for name, options in aliases.items()}
     missing = [name for name, source in resolved.items() if source is None]
     if missing:
         return pd.DataFrame(columns=EMPLOYEE_MASTER_COLUMNS)
 
     out = employee_master[[resolved[c] for c in EMPLOYEE_MASTER_COLUMNS]].copy()
     out.columns = EMPLOYEE_MASTER_COLUMNS
-    out["ERP"] = out["ERP"].apply(_clean_text)
+    out["ERP"] = out["ERP"].apply(_retention_clean_text)
     for col in ["Branch", "Designation", "Company Code"]:
-        out[col] = out[col].apply(_clean_text)
-    out = out[out["ERP"].ne("")]
-    return out.drop_duplicates(subset=["ERP"], keep="last").reset_index(drop=True)
+        out[col] = out[col].apply(_retention_clean_text)
+    out = out.loc[out["ERP"].ne("")]
+
+    out["__erp_key"] = _retention_normalise_key_series(out["ERP"])
+    out = out.drop_duplicates(subset=["__erp_key"], keep="last")
+    return out.drop(columns="__erp_key").reset_index(drop=True)
 
 
 def _attach_employee_profile(
     paysheet: pd.DataFrame,
     erp_col: str,
-    employee_master: pd.DataFrame | None,
+    employee_master: pd.DataFrame = None,
 ) -> pd.DataFrame:
     out = paysheet.copy()
-    out[erp_col] = out[erp_col].apply(_clean_text)
+    out[erp_col] = out[erp_col].apply(_retention_clean_text)
+    profile_columns = ["Branch", "Designation", "Company Code"]
 
-    # If the paysheet already contains these optional fields, keep them.
-    required_profile = ["Branch", "Designation", "Company Code"]
-    missing_profile = [c for c in required_profile if c not in out.columns]
-
-    master = normalise_employee_master(employee_master)
-    if missing_profile and not master.empty:
-        master = master.copy()
-        master["__erp_key"] = _normalise_key_series(master["ERP"])
-        out["__erp_key"] = _normalise_key_series(out[erp_col])
-        source = master[["__erp_key"] + missing_profile].drop_duplicates("__erp_key", keep="last")
-        out = out.merge(source, on="__erp_key", how="left")
-        out = out.drop(columns="__erp_key")
-
-    for col in required_profile:
+    # If optional profile columns already exist in a source sheet, use them;
+    # fill missing/blank values from the central Employee Database.
+    for col in profile_columns:
         if col not in out.columns:
             out[col] = ""
-        out[col] = out[col].apply(_clean_text)
+        out[col] = out[col].apply(_retention_clean_text)
+
+    master = normalise_employee_master(employee_master)
+    if not master.empty:
+        master = master.copy()
+        master["__erp_key"] = _retention_normalise_key_series(master["ERP"])
+        master = master.drop_duplicates("__erp_key", keep="last")
+        master = master.set_index("__erp_key")
+
+        erp_keys = _retention_normalise_key_series(out[erp_col])
+        for col in profile_columns:
+            mapped = erp_keys.map(master[col])
+            blank = out[col].eq("")
+            out.loc[blank, col] = mapped.loc[blank].fillna("")
 
     out["Employee Master Mapping Missing"] = (
-        out["Branch"].eq("") | out["Designation"].eq("") | out["Company Code"].eq("")
+        out["Branch"].eq("")
+        | out["Designation"].eq("")
+        | out["Company Code"].eq("")
     )
     return out
 
 
-def _attach_customize_rule(out: pd.DataFrame, customize_dashboard: pd.DataFrame | None) -> pd.DataFrame:
-    rules = _prepare_customize_dashboard(
-        customize_dashboard if customize_dashboard is not None else pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
-    )
+def _attach_customize_rule(out: pd.DataFrame, customize_dashboard: pd.DataFrame = None) -> pd.DataFrame:
+    rules = _prepare_customize_dashboard(customize_dashboard)
+    result = out.copy()
 
-    out = out.copy()
-    out["__branch_key"] = _normalise_key_series(out["Branch"])
-    out["__cc_key"] = _normalise_key_series(out["Company Code"])
-    out["__desig_key"] = _normalise_key_series(out["Designation"])
+    result["__branch_key"] = _retention_normalise_key_series(result["Branch"])
+    result["__cc_key"] = _retention_normalise_key_series(result["Company Code"])
+    result["__designation_key"] = _retention_normalise_key_series(result["Designation"])
 
     if rules.empty:
-        out["Employment Type"] = None
-        out["Retention Applicable"] = None
-        out["Customize Rule Matched"] = False
-        return out.drop(columns=["__branch_key", "__cc_key", "__desig_key"])
+        result["Employment Type"] = None
+        result["Retention Applicable"] = None
+        result["Customize Rule Matched"] = False
+        return result.drop(columns=["__branch_key", "__cc_key", "__designation_key"])
 
     rules = rules.copy()
-    rules["__branch_key"] = _normalise_key_series(rules["Branch"])
-    rules["__cc_key"] = _normalise_key_series(rules["Company Code"])
-    rules["__desig_key"] = _normalise_key_series(rules["Designation"])
+    rules["__branch_key"] = _retention_normalise_key_series(rules["Branch"])
+    rules["__cc_key"] = _retention_normalise_key_series(rules["Company Code"])
+    rules["__designation_key"] = _retention_normalise_key_series(rules["Designation"])
     rules["Customize Rule Matched"] = True
 
-    # Only bring the rule outputs; Branch / Designation / Company Code already
-    # came from the employee master and remain the reporting attributes.
-    rule_cols = [
+    rule_columns = [
         "__branch_key",
         "__cc_key",
-        "__desig_key",
+        "__designation_key",
         "Employment Type",
         "Retention Applicable",
         "Customize Rule Matched",
     ]
-    out = out.merge(
-        rules[rule_cols],
-        on=["__branch_key", "__cc_key", "__desig_key"],
+    result = result.merge(
+        rules[rule_columns],
+        on=["__branch_key", "__cc_key", "__designation_key"],
         how="left",
     )
-    out["Customize Rule Matched"] = out["Customize Rule Matched"].eq(True)
-    return out.drop(columns=["__branch_key", "__cc_key", "__desig_key"])
+    result["Customize Rule Matched"] = result["Customize Rule Matched"].eq(True)
+    return result.drop(columns=["__branch_key", "__cc_key", "__designation_key"])
 
+
+# --------------------------------------------------------------------------
+# Core Retention Fund computation
+# --------------------------------------------------------------------------
 
 def compute_paysheet_deduction(
     df: pd.DataFrame,
@@ -706,56 +803,78 @@ def compute_paysheet_deduction(
     deduction_pct: float = 10.0,
     employee_master: pd.DataFrame = None,
 ) -> pd.DataFrame:
-    """Compute one month's Retention Fund.
+    """Compute one monthly Retention Fund paysheet.
 
-    Formula: min(10% of Monthly Gross, Net Pay).
+    Backward compatibility: the older parameters are retained and the new
+    `employee_master` parameter is appended at the end.
 
-    The First Hire Date *month* controls eligibility. Example: an employee
-    first hired on 20-Sep-2026 is eligible for the September 2026 paysheet.
-    There is no Joining Date or Internal Transfer logic in this calculation.
+    New rule: First Hire Date month is the starting month. There is no
+    Internal Transfer or Joining-Date-in-payroll-cycle logic.
     """
     required = [erp_col, first_hire_col, net_pay_col, gross_col]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Paysheet is missing required column(s): {', '.join(missing)}")
 
-    if deduction_pct < 0:
-        raise ValueError("Deduction percentage cannot be negative.")
+    # Business requirement is fixed at 10%; caller can keep passing 10.0 for
+    # compatibility, but negative/other values are rejected to avoid drift.
+    if float(deduction_pct) != 10.0:
+        raise ValueError("Retention Fund deduction percentage must be exactly 10%.")
 
     out = df.copy()
-    out[erp_col] = out[erp_col].apply(_clean_text)
+    out[erp_col] = out[erp_col].apply(_retention_clean_text)
     if out[erp_col].eq("").any():
         raise ValueError("ERP cannot be blank in a paysheet.")
-    if out[erp_col].str.upper().duplicated().any():
-        dupes = out.loc[out[erp_col].str.upper().duplicated(keep=False), erp_col].head(10).tolist()
-        raise ValueError(f"Duplicate ERP(s) found in the same paysheet month: {', '.join(map(str, dupes))}")
+
+    erp_key = out[erp_col].str.upper()
+    if erp_key.duplicated().any():
+        duplicates = out.loc[erp_key.duplicated(keep=False), erp_col].astype(str).head(10).tolist()
+        raise ValueError(
+            "Duplicate ERP(s) found in the same monthly paysheet: " + ", ".join(duplicates)
+        )
 
     out[gross_col] = coerce_numeric_column(out[gross_col], gross_col)
     out[net_pay_col] = coerce_numeric_column(out[net_pay_col], net_pay_col)
 
-    # First Hire Date is the ONLY hire-date basis used for Retention Fund.
     out["First Hire Date"] = pd.to_datetime(out[first_hire_col], errors="coerce")
     out["First Hire Date Valid"] = out["First Hire Date"].notna()
 
     month_ts = pd.Timestamp(paysheet_month).to_period("M").to_timestamp()
     out["Paysheet Month"] = month_ts
-    first_hire_period = out["First Hire Date"].dt.to_period("M")
+    hire_month = out["First Hire Date"].dt.to_period("M")
     out["Hired By This Month"] = (
-        out["First Hire Date Valid"] & (first_hire_period <= month_ts.to_period("M"))
+        out["First Hire Date Valid"]
+        & (hire_month <= month_ts.to_period("M"))
     )
 
-    # Hard ERP-level exclusions.
-    exceptional_set = {_clean_text(v).upper() for v in (exceptional_erps or []) if _clean_text(v)}
+    exceptional_set = {
+        _retention_clean_text(v).upper()
+        for v in (exceptional_erps or [])
+        if _retention_clean_text(v)
+    }
     out["Exceptional ERP"] = out[erp_col].str.upper().isin(exceptional_set)
 
-    # Four-column consolidated paysheet is enriched using Employee Database.
     out = _attach_employee_profile(out, erp_col=erp_col, employee_master=employee_master)
     out = _attach_customize_rule(out, customize_dashboard=customize_dashboard)
 
-    out["Financial Data Valid"] = out[gross_col].notna() & out[net_pay_col].notna()
-    out["10% of Gross"] = out[gross_col] * (deduction_pct / 100.0)
+    # Do not allow negative or missing financials to generate a deduction.
+    out["Financial Data Valid"] = (
+        out[gross_col].notna()
+        & out[net_pay_col].notna()
+        & out[gross_col].ge(0)
+        & out[net_pay_col].ge(0)
+    )
 
-    retention_yes = out["Retention Applicable"].fillna("").astype(str).str.strip().str.lower().eq("yes")
+    out["10% of Gross"] = out[gross_col] * 0.10
+    retention_yes = (
+        out["Retention Applicable"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("yes")
+    )
+
     out["Deduction Applicable"] = (
         out["First Hire Date Valid"]
         & out["Hired By This Month"]
@@ -767,12 +886,12 @@ def compute_paysheet_deduction(
     )
 
     out["Deduction Amount"] = 0.0
-    if out["Deduction Applicable"].any():
-        idx = out["Deduction Applicable"]
-        # Exact requested formula. Floor at zero prevents a negative recovery
-        # amount from turning into a negative Retention Fund deduction.
-        raw = out.loc[idx, ["10% of Gross", net_pay_col]].min(axis=1, skipna=False)
-        out.loc[idx, "Deduction Amount"] = raw.clip(lower=0)
+    applicable = out["Deduction Applicable"]
+    if applicable.any():
+        # Exact requested formula: min(10% of Monthly Gross, Net Pay).
+        out.loc[applicable, "Deduction Amount"] = out.loc[
+            applicable, ["10% of Gross", net_pay_col]
+        ].min(axis=1)
 
     def _status(row):
         if not row["First Hire Date Valid"]:
@@ -788,7 +907,7 @@ def compute_paysheet_deduction(
         if str(row.get("Retention Applicable", "")).strip().lower() != "yes":
             return "Retention Not Applicable"
         if not row["Financial Data Valid"]:
-            return "Missing Pay Data"
+            return "Invalid Pay Data"
         if row["Deduction Amount"] <= 0:
             return "No Deduction"
         return "Pending Release"
@@ -805,20 +924,19 @@ def process_consolidated_paysheets(
     employee_master: pd.DataFrame = None,
     deduction_pct: float = 10.0,
 ) -> tuple:
-    """Process many months in one run using one canonical First Hire Date.
+    """Process several monthly paysheets using one canonical First Hire Date.
 
-    `monthly_inputs` accepts dictionaries like:
-      {"month": "2026-06", "data": dataframe, "source": "Jun.xlsx"}
-    or tuples: (month, dataframe).
+    Each item can be:
+      {"month": <date/timestamp>, "data": <DataFrame>, "source": <filename>}
+    or a tuple (month, dataframe[, source]).
 
-    The earliest valid First Hire Date found for an ERP across all uploaded
-    monthly paysheets becomes that ERP's canonical First Hire Date. This is
-    important because "first hire" must remain stable across months even if
-    a later source file contains an inconsistent date. Any inconsistency is
-    retained as an audit flag in the output.
-
-    Returns (erp_summary, combined_month_wise_detail).
+    If different uploaded months contain different First Hire Dates for the
+    same ERP, the earliest valid date is treated as the canonical First Hire
+    Date and the inconsistency is flagged for audit.
     """
+    if float(deduction_pct) != 10.0:
+        raise ValueError("Retention Fund deduction percentage must be exactly 10%.")
+
     prepared = []
     hire_rows = []
 
@@ -828,7 +946,8 @@ def process_consolidated_paysheets(
             data = item.get("data")
             source = item.get("source", "")
         else:
-            month, data = item[0], item[1]
+            month = item[0]
+            data = item[1]
             source = item[2] if len(item) > 2 else ""
 
         if data is None or data.empty:
@@ -836,10 +955,15 @@ def process_consolidated_paysheets(
 
         missing = [c for c in CONSOLIDATED_PAYSHEET_COLUMNS if c not in data.columns]
         if missing:
-            raise ValueError(f"{source or 'Paysheet'} is missing required column(s): {', '.join(missing)}")
+            raise ValueError(
+                f"{source or 'Paysheet'} is missing required column(s): {', '.join(missing)}"
+            )
 
         work = data.copy()
-        work["ERP"] = work["ERP"].apply(_clean_text)
+        work["ERP"] = work["ERP"].apply(_retention_clean_text)
+        if work["ERP"].eq("").any():
+            raise ValueError(f"{source or 'Paysheet'} contains a blank ERP.")
+
         work["__erp_key"] = work["ERP"].str.upper()
         work["__uploaded_first_hire"] = pd.to_datetime(work["First Hire Date"], errors="coerce")
 
@@ -850,16 +974,10 @@ def process_consolidated_paysheets(
         return pd.DataFrame(), pd.DataFrame()
 
     all_hires = pd.concat(hire_rows, ignore_index=True)
-    canonical = (
-        all_hires.dropna(subset=["__uploaded_first_hire"])
-        .groupby("__erp_key")["__uploaded_first_hire"]
-        .min()
-    )
-    distinct_dates = (
-        all_hires.dropna(subset=["__uploaded_first_hire"])
-        .groupby("__erp_key")["__uploaded_first_hire"]
-        .nunique()
-    )
+    valid_hires = all_hires.dropna(subset=["__uploaded_first_hire"])
+
+    canonical = valid_hires.groupby("__erp_key")["__uploaded_first_hire"].min()
+    distinct_dates = valid_hires.groupby("__erp_key")["__uploaded_first_hire"].nunique()
     variance_map = distinct_dates.gt(1).to_dict()
 
     monthly_results = []
@@ -867,8 +985,13 @@ def process_consolidated_paysheets(
         work = item["data"].copy()
         work["Uploaded First Hire Date"] = work["__uploaded_first_hire"]
         work["First Hire Date"] = work["__erp_key"].map(canonical)
-        work["First Hire Date Variance"] = work["__erp_key"].map(variance_map).fillna(False).astype(bool)
-        work["First Hire Date Recovered"] = work["__uploaded_first_hire"].isna() & work["First Hire Date"].notna()
+        work["First Hire Date Variance"] = (
+            work["__erp_key"].map(variance_map).fillna(False).astype(bool)
+        )
+        work["First Hire Date Recovered"] = (
+            work["__uploaded_first_hire"].isna()
+            & work["First Hire Date"].notna()
+        )
         work = work.drop(columns=["__uploaded_first_hire", "__erp_key"])
 
         result = compute_paysheet_deduction(
@@ -880,7 +1003,7 @@ def process_consolidated_paysheets(
             paysheet_month=item["month"],
             exceptional_erps=exceptional_erps,
             customize_dashboard=customize_dashboard,
-            deduction_pct=deduction_pct,
+            deduction_pct=10.0,
             employee_master=employee_master,
         )
         result["Source File"] = item["source"]
@@ -888,20 +1011,30 @@ def process_consolidated_paysheets(
 
     return consolidate_paysheet_months(monthly_results, erp_col="ERP")
 
+
 def consolidate_paysheet_months(monthly_results: list, erp_col: str = "ERP") -> tuple:
-    """Create one ERP summary plus the full month-wise detail table."""
+    """Return (ERP-level summary, month-wise consolidated detail)."""
     if not monthly_results:
         return pd.DataFrame(), pd.DataFrame()
 
     combined = pd.concat(monthly_results, ignore_index=True)
-    combined["Paysheet Month"] = pd.to_datetime(combined["Paysheet Month"]).dt.to_period("M").dt.to_timestamp()
+    combined["Paysheet Month"] = (
+        pd.to_datetime(combined["Paysheet Month"])
+        .dt.to_period("M")
+        .dt.to_timestamp()
+    )
 
-    # Prevent accidental double deduction when the same ERP/month is uploaded twice.
-    duplicate_pair = combined.duplicated(subset=[erp_col, "Paysheet Month"], keep=False)
+    duplicate_pair = combined.duplicated(
+        subset=[erp_col, "Paysheet Month"],
+        keep=False,
+    )
     if duplicate_pair.any():
         examples = combined.loc[duplicate_pair, [erp_col, "Paysheet Month"]].head(10).copy()
         examples["Paysheet Month"] = examples["Paysheet Month"].dt.strftime("%b-%Y")
-        pairs = ", ".join(f"{r[erp_col]} ({r['Paysheet Month']})" for _, r in examples.iterrows())
+        pairs = ", ".join(
+            f"{row[erp_col]} ({row['Paysheet Month']})"
+            for _, row in examples.iterrows()
+        )
         raise ValueError(f"The same ERP/month was uploaded more than once: {pairs}")
 
     combined = combined.sort_values([erp_col, "Paysheet Month"]).reset_index(drop=True)
@@ -938,11 +1071,18 @@ def consolidate_paysheet_months(monthly_results: list, erp_col: str = "ERP") -> 
     return summary.sort_values(erp_col).reset_index(drop=True), combined
 
 
-def _group_report(combined: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    if combined.empty or group_col not in combined.columns:
+def _retention_group_report(combined: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    if combined is None or combined.empty or group_col not in combined.columns:
         return pd.DataFrame()
+
     work = combined.copy()
-    work[group_col] = work[group_col].fillna("").astype(str).str.strip().replace("", "Unmapped")
+    work[group_col] = (
+        work[group_col]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .replace("", "Unmapped")
+    )
     return (
         work.groupby(group_col, dropna=False)
         .agg(
@@ -958,24 +1098,27 @@ def _group_report(combined: pd.DataFrame, group_col: str) -> pd.DataFrame:
 
 
 def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> dict:
-    """Build all reports required after the new First Hire Date logic."""
+    """Create the complete Retention Fund reporting pack."""
+    empty_report = {
+        "ERP Summary": pd.DataFrame(),
+        "Month Wise Detail": pd.DataFrame(),
+        "Monthly Summary": pd.DataFrame(),
+        "Branch Summary": pd.DataFrame(),
+        "Designation Summary": pd.DataFrame(),
+        "Company Summary": pd.DataFrame(),
+        "Employment Type Summary": pd.DataFrame(),
+        "Status Summary": pd.DataFrame(),
+        "Pending Releases": pd.DataFrame(),
+        "Exceptions - No Deduction": pd.DataFrame(),
+        "Missing Mapping": pd.DataFrame(),
+        "First Hire Date Audit": pd.DataFrame(),
+    }
     if combined is None or combined.empty:
-        return {
-            "ERP Summary": pd.DataFrame(),
-            "Month Wise Detail": pd.DataFrame(),
-            "Monthly Summary": pd.DataFrame(),
-            "Branch Summary": pd.DataFrame(),
-            "Designation Summary": pd.DataFrame(),
-            "Company Summary": pd.DataFrame(),
-            "Employment Type Summary": pd.DataFrame(),
-            "Status Summary": pd.DataFrame(),
-            "Exceptions / No Deduction": pd.DataFrame(),
-            "Missing Mapping": pd.DataFrame(),
-            "First Hire Date Audit": pd.DataFrame(),
-        }
+        return empty_report
 
     work = combined.copy()
     work["Paysheet Month"] = pd.to_datetime(work["Paysheet Month"])
+
     monthly = (
         work.groupby("Paysheet Month")
         .agg(
@@ -989,244 +1132,39 @@ def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> di
         .sort_values("Paysheet Month")
     )
 
-    status = (
+    status_summary = (
         work.groupby("Status", dropna=False)
-        .agg(Rows=("ERP", "size"), Employees=("ERP", "nunique"), Total_Retention_Fund=("Deduction Amount", "sum"))
+        .agg(
+            Rows=("ERP", "size"),
+            Employees=("ERP", "nunique"),
+            Total_Retention_Fund=("Deduction Amount", "sum"),
+        )
         .reset_index()
         .sort_values(["Rows", "Status"], ascending=[False, True])
     )
 
-    exceptions = work.loc[work["Status"] != "Pending Release"].copy()
+    pending = work.loc[work["Status"].eq("Pending Release")].copy()
+    exceptions = work.loc[~work["Status"].eq("Pending Release")].copy()
     missing_mapping = work.loc[
         work["Status"].isin(["Employee Master Mapping Missing", "Customize Rule Missing"])
     ].copy()
     first_hire_audit = work.loc[
-        work.get("First Hire Date Variance", False) | work.get("First Hire Date Recovered", False)
+        work["First Hire Date Variance"].fillna(False)
+        | work["First Hire Date Recovered"].fillna(False)
+        | work["Status"].eq("Invalid First Hire Date")
     ].copy()
 
     return {
         "ERP Summary": summary.copy(),
         "Month Wise Detail": work,
         "Monthly Summary": monthly,
-        "Branch Summary": _group_report(work, "Branch"),
-        "Designation Summary": _group_report(work, "Designation"),
-        "Company Summary": _group_report(work, "Company Code"),
-        "Employment Type Summary": _group_report(work, "Employment Type"),
-        "Status Summary": status,
-        "Exceptions / No Deduction": exceptions,
+        "Branch Summary": _retention_group_report(work, "Branch"),
+        "Designation Summary": _retention_group_report(work, "Designation"),
+        "Company Summary": _retention_group_report(work, "Company Code"),
+        "Employment Type Summary": _retention_group_report(work, "Employment Type"),
+        "Status Summary": status_summary,
+        "Pending Releases": pending,
+        "Exceptions - No Deduction": exceptions,
         "Missing Mapping": missing_mapping,
         "First Hire Date Audit": first_hire_audit,
     }
-
-
-def infer_paysheet_month_from_filename(filename: str):
-    """Best-effort month detection used by the multi-file Streamlit section."""
-    name = os.path.splitext(os.path.basename(filename or ""))[0]
-
-    # 2026-09 / 2026_09 / 202609
-    m = re.search(r"(?<!\d)(20\d{2})[-_ ]?(0?[1-9]|1[0-2])(?!\d)", name)
-    if m:
-        return pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
-
-    month_map = {
-        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
-        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
-        "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9, "oct": 10,
-        "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
-    }
-    lower = name.lower()
-    year_match = re.search(r"(?<!\d)(20\d{2})(?!\d)", lower)
-    if year_match:
-        for token, month_no in month_map.items():
-            if re.search(rf"\b{re.escape(token)}\b", lower):
-                return pd.Timestamp(year=int(year_match.group(1)), month=month_no, day=1)
-    return None
-
-
-# --------------------------------------------------------------------------
-# Optional Streamlit UI renderer for pages/2_Retention_Fund.py
-# --------------------------------------------------------------------------
-
-def render_retention_fund_workspace():
-    """Render Customize Dashboard, Exceptional ERP, Compute and Reports.
-
-    A Retention Fund page can call this function after its normal login/nav
-    checks. The 4-column paysheet format is kept exactly as requested; the
-    existing Employee Database in session_state is used to auto-map ERP to
-    Branch / Designation / Company Code.
-    """
-    st.header("💰 Retention Fund")
-    st.caption(
-        "First Hire Date based calculation • No internal-transfer logic • "
-        "Deduction = min(10% of Monthly Gross, Net Pay)"
-    )
-
-    tab_customize, tab_exceptions, tab_compute, tab_reports = st.tabs(
-        ["Customize Dashboard", "Exceptional ERP", "Consolidated Compute", "Reports"]
-    )
-
-    with tab_customize:
-        st.subheader("Customize Dashboard")
-        st.write(
-            "Bulk upload only **Branch, Company Code and Designation**. "
-            "Employment Type and Retention Applicable are maintained using dropdowns."
-        )
-        st.download_button(
-            "⬇️ Download Customize Sample",
-            data=to_excel_bytes({"Customize Sample": sample_customize_dashboard_bulk_template()}),
-            file_name="customize_dashboard_sample.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        upload = st.file_uploader(
-            "Upload Customize rules (.xlsx/.csv)",
-            type=["xlsx", "xls", "csv"],
-            key="retention_customize_upload",
-        )
-        rules = load_customize_dashboard()
-        if upload is not None:
-            try:
-                uploaded_df = read_any_table(upload)
-                rules = merge_customize_dashboard_bulk_upload(
-                    rules,
-                    uploaded_df,
-                    branch_col="Branch",
-                    cc_col="Company Code",
-                    designation_col="Designation",
-                )
-                st.success(f"Loaded {len(rules):,} customize rule(s). Review dropdowns and save.")
-            except Exception as exc:
-                st.error(safe_error_message(exc, "reading the Customize Dashboard upload"))
-
-        edited_rules = st.data_editor(
-            rules,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="dynamic",
-            column_config={
-                "Employment Type": st.column_config.SelectboxColumn(
-                    "Employment Type", options=EMPLOYMENT_TYPE_OPTIONS, required=True
-                ),
-                "Retention Applicable": st.column_config.SelectboxColumn(
-                    "Retention Applicable", options=RETENTION_APPLICABLE_OPTIONS, required=True
-                ),
-            },
-            key="retention_customize_editor",
-        )
-        if st.button("💾 Save Customize Dashboard", key="save_customize_dashboard"):
-            save_customize_dashboard(edited_rules)
-            st.success("Customize Dashboard saved.")
-
-    with tab_exceptions:
-        st.subheader("Exceptional ERP Cases")
-        st.write("ERPs saved here will never have Retention Fund deducted, regardless of any other rule.")
-        current_erps = load_exceptional_erps()
-        erp_text = st.text_area(
-            "ERP list (one ERP per line)",
-            value="\n".join(current_erps),
-            height=220,
-            key="exceptional_erp_text",
-        )
-        if st.button("💾 Save Exceptional ERPs", key="save_exceptional_erps"):
-            values = [line.strip() for line in erp_text.splitlines() if line.strip()]
-            save_exceptional_erps(values)
-            st.success(f"Saved {len(set(v.upper() for v in values)):,} exceptional ERP(s).")
-
-    with tab_compute:
-        st.subheader("Consolidated Paysheet Compute")
-        st.write(
-            "Upload paysheets for different months. Each monthly file must contain only: "
-            "**ERP, First Hire Date, Net Pay, Monthly Gross**."
-        )
-        st.download_button(
-            "⬇️ Download Consolidated Paysheet Sample",
-            data=to_excel_bytes({"Paysheet Sample": sample_consolidated_paysheet_template()}),
-            file_name="consolidated_paysheet_sample.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-        files = st.file_uploader(
-            "Upload monthly paysheets",
-            type=["xlsx", "xls", "csv"],
-            accept_multiple_files=True,
-            key="consolidated_paysheet_uploads",
-        )
-
-        employee_master = st.session_state.get("employee_db")
-        if employee_master is None or normalise_employee_master(employee_master).empty:
-            st.warning(
-                "Employee Database mapping is not available. The 4-column paysheet does not contain "
-                "Branch / Designation / Company Code, so unmapped ERPs will be blocked from deduction."
-            )
-
-        monthly_inputs = []
-        for i, uploaded in enumerate(files or []):
-            try:
-                data = read_any_table(uploaded)
-                missing = [c for c in CONSOLIDATED_PAYSHEET_COLUMNS if c not in data.columns]
-                if missing:
-                    st.error(f"{uploaded.name}: missing {', '.join(missing)}")
-                    continue
-
-                inferred = infer_paysheet_month_from_filename(uploaded.name)
-                default_month = inferred if inferred is not None else pd.Timestamp.today().to_period("M").to_timestamp()
-                c1, c2 = st.columns([2, 1])
-                with c1:
-                    st.write(f"**{uploaded.name}** — {len(data):,} row(s)")
-                with c2:
-                    selected_date = st.date_input(
-                        "Paysheet month",
-                        value=default_month.date(),
-                        key=f"paysheet_month_{i}_{uploaded.name}",
-                    )
-                monthly_inputs.append({"month": selected_date, "data": data, "source": uploaded.name})
-            except Exception as exc:
-                st.error(safe_error_message(exc, f"reading {uploaded.name}"))
-
-        if st.button("🧮 Compute Retention Fund", type="primary", disabled=not monthly_inputs):
-            try:
-                summary, combined = process_consolidated_paysheets(
-                    monthly_inputs,
-                    exceptional_erps=load_exceptional_erps(),
-                    customize_dashboard=load_customize_dashboard(),
-                    employee_master=employee_master,
-                    deduction_pct=10.0,
-                )
-                st.session_state["consolidated_paysheet_summary"] = summary
-                st.session_state["consolidated_paysheet_result"] = combined
-                st.success(
-                    f"Processed {combined['Paysheet Month'].nunique():,} month(s), "
-                    f"{combined['ERP'].nunique():,} ERP(s). Total Retention Fund: "
-                    f"₹{combined['Deduction Amount'].sum():,.2f}"
-                )
-            except Exception as exc:
-                st.error(safe_error_message(exc, "computing consolidated Retention Fund"))
-
-        combined_now = st.session_state.get("consolidated_paysheet_result")
-        if isinstance(combined_now, pd.DataFrame) and not combined_now.empty:
-            preview_cols = [
-                "ERP", "Paysheet Month", "First Hire Date", "Branch", "Designation",
-                "Employment Type", "Company Code", "Retention Applicable", "Net Pay",
-                "Monthly Gross", "10% of Gross", "Deduction Amount", "Status",
-            ]
-            st.dataframe(combined_now[[c for c in preview_cols if c in combined_now.columns]], use_container_width=True)
-
-    with tab_reports:
-        st.subheader("Retention Fund Reports")
-        summary = st.session_state.get("consolidated_paysheet_summary")
-        combined = st.session_state.get("consolidated_paysheet_result")
-        if not isinstance(combined, pd.DataFrame) or combined.empty:
-            st.info("Run Consolidated Compute first to generate reports.")
-        else:
-            reports = build_retention_reports(summary, combined)
-            report_names = list(reports.keys())
-            selected = st.selectbox("Report", report_names, key="retention_report_selector")
-            st.dataframe(reports[selected], use_container_width=True)
-            st.download_button(
-                "⬇️ Download All Retention Reports",
-                data=to_excel_bytes(reports),
-                file_name="retention_fund_reports.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-    render_clear_data_button()
