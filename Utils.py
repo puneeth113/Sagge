@@ -287,22 +287,18 @@ DEFAULT_ABSENCE_THRESHOLDS = [
 # the Retention Fund module. Older public helper names/signatures are retained
 # where practical so other pages that import util.py do not break.
 #
-# Retention deduction rules:
+# Current Retention Fund flow:
 #   * No Internal Transfer logic.
 #   * First Hire Date is the only hire-date basis.
-#   * The First Hire Date calendar month itself is eligible.
-#   * Deduction = min(10% of Monthly Gross, Net Pay).
-#   * Customize Dashboard rules are keyed by Branch + Company Code +
-#     Designation.
-#   * Employment Type options: Full Time / Non-Full Time.
-#   * Retention Applicable options: Yes / No.
-#   * No deduction for configured Company Codes.
-#   * No deduction for Exceptional ERPs.
-#   * No deduction for Non-Full Time employees.
-#   * No deduction when Retention Applicable = No.
+#   * A single "full book" paysheet is uploaded with Wage Month on every row.
+#   * Retention can be deducted only in employment months 1, 2 and 3.
+#   * Deduction for an eligible month = min(10% of Monthly Gross, Net Pay).
+#   * Customize rules are keyed by Branch + Company Code + Designation.
+#   * No deduction for excluded Company Codes, Exceptional ERPs,
+#     Non-Full Time employees, or Retention Applicable = No.
+#   * Expected Release Date = First Hire Date + admin-selected release days.
+#   * Release Due = 3 deductions completed AND Expected Release Date reached.
 
-# No company is silently excluded by default. Admins explicitly maintain the
-# list from the Retention Fund Customize Dashboard.
 DEFAULT_IGNORED_COMPANY_CODES = []
 
 _APP_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -323,7 +319,15 @@ CUSTOMIZE_DASHBOARD_COLUMNS = [
     "Retention Applicable",
 ]
 
-CONSOLIDATED_PAYSHEET_COLUMNS = ["ERP", "First Hire Date", "Net Pay", "Monthly Gross"]
+# Public name retained for compatibility. The new full-book format includes
+# Wage Month because the payroll month varies row by row inside one file.
+CONSOLIDATED_PAYSHEET_COLUMNS = [
+    "ERP",
+    "First Hire Date",
+    "Wage Month",
+    "Net Pay",
+    "Monthly Gross",
+]
 EMPLOYEE_MASTER_COLUMNS = ["ERP", "Branch", "Designation", "Company Code"]
 
 
@@ -343,19 +347,11 @@ def _retention_normalise_key_series(series: pd.Series) -> pd.Series:
 
 
 def normalise_retention_employment_type(value) -> str:
-    """Return Full Time or Non-Full Time.
-
-    Older saved labels such as Gig Worker, Consultant, Contractual and Part
-    Time are safely migrated to Non-Full Time. Blank/unknown legacy values are
-    treated as Full Time only so an existing rule can still be displayed and
-    edited after upgrade.
-    """
+    """Normalize old/new labels to Full Time or Non-Full Time."""
     text = _retention_clean_text(value).lower().replace("_", " ")
     text = " ".join(text.split())
-
     if text in {"full time", "full-time", "fulltime", "ft"}:
         return "Full Time"
-
     if text in {
         "non full time", "non-full time", "non-full-time", "nonfulltime",
         "gig", "gig worker", "part time", "part-time", "parttime",
@@ -363,18 +359,11 @@ def normalise_retention_employment_type(value) -> str:
         "contract", "temporary", "temp",
     }:
         return "Non-Full Time"
-
     return "Full Time"
 
 
 def normalise_retention_applicable(value, employment_type=None) -> str:
-    """Return Yes/No while preserving an explicit dashboard choice.
-
-    For migrated/blank rows only, the sensible default is Yes for Full Time
-    and No for Non-Full Time. Actual computation still blocks Non-Full Time
-    even if someone manually selects Yes, because Employment Type is a hard
-    exclusion rule.
-    """
+    """Normalize the editable Retention Applicable setting to Yes/No."""
     text = _retention_clean_text(value).lower()
     if text in {"yes", "y", "true", "1"}:
         return "Yes"
@@ -384,12 +373,10 @@ def normalise_retention_applicable(value, employment_type=None) -> str:
 
 
 def retention_applicable_from_employment_type(value) -> str:
-    """Compatibility helper: default applicability for an employment type."""
     return "Yes" if normalise_retention_employment_type(value) == "Full Time" else "No"
 
 
 def retention_remark_from_employment_type(value) -> str:
-    """Compatibility helper used by older report code."""
     if normalise_retention_employment_type(value) == "Full Time":
         return "Retention Eligible - Full Time"
     return "No Deduction - Non-Full Time"
@@ -400,7 +387,6 @@ def retention_remark_from_employment_type(value) -> str:
 # --------------------------------------------------------------------------
 
 def load_ignored_company_codes() -> list:
-    """Return Company Codes that must never have Retention Fund deducted."""
     if not os.path.exists(_IGNORED_CC_FILE):
         return list(DEFAULT_IGNORED_COMPANY_CODES)
     try:
@@ -418,7 +404,6 @@ def load_ignored_company_codes() -> list:
 
 
 def save_ignored_company_codes(codes: list):
-    """Persist Company Codes excluded from Retention Fund deduction."""
     os.makedirs(_DATA_DIR, exist_ok=True)
     clean = sorted({
         _retention_clean_text(v).upper()
@@ -430,7 +415,6 @@ def save_ignored_company_codes(codes: list):
 
 
 def sample_ignored_company_code_bulk_template() -> pd.DataFrame:
-    """One-column template for excluded Company Codes."""
     return pd.DataFrame({"Company Code": ["COMPANY_A", "COMPANY_B"]})
 
 
@@ -439,10 +423,8 @@ def merge_ignored_company_code_bulk_upload(
     upload_df: pd.DataFrame,
     company_code_col: str = "Company Code",
 ) -> list:
-    """Merge a one-column Company Code upload into the exclusion list."""
     if upload_df is None or company_code_col not in upload_df.columns:
         raise ValueError("Company Code exclusion upload must contain a Company Code column.")
-
     uploaded = {
         _retention_clean_text(v).upper()
         for v in upload_df[company_code_col].tolist()
@@ -461,7 +443,6 @@ def merge_ignored_company_code_bulk_upload(
 # --------------------------------------------------------------------------
 
 def load_exceptional_erps() -> list:
-    """Return ERPs that must never have Retention Fund deducted."""
     if not os.path.exists(_EXCEPTIONAL_ERP_FILE):
         return []
     try:
@@ -479,7 +460,6 @@ def load_exceptional_erps() -> list:
 
 
 def save_exceptional_erps(erps: list):
-    """Persist exceptional ERP exclusions."""
     os.makedirs(_DATA_DIR, exist_ok=True)
     clean = sorted({
         _retention_clean_text(v).upper()
@@ -491,7 +471,6 @@ def save_exceptional_erps(erps: list):
 
 
 def sample_exceptional_erp_bulk_template() -> pd.DataFrame:
-    """One-column template for bulk Exceptional ERP upload."""
     return pd.DataFrame({"ERP": ["ERP00123", "ERP00456"]})
 
 
@@ -500,10 +479,8 @@ def merge_exceptional_erp_bulk_upload(
     upload_df: pd.DataFrame,
     erp_col: str = "ERP",
 ) -> list:
-    """Merge Exceptional ERPs from an uploaded sheet into the saved list."""
     if upload_df is None or erp_col not in upload_df.columns:
         raise ValueError("Exceptional ERP upload must contain an ERP column.")
-
     uploaded = {
         _retention_clean_text(v).upper()
         for v in upload_df[erp_col].tolist()
@@ -522,27 +499,14 @@ def merge_exceptional_erp_bulk_upload(
 # --------------------------------------------------------------------------
 
 def _prepare_customize_dashboard(df: pd.DataFrame) -> pd.DataFrame:
-    """Validate and normalize the Retention Customize rule master.
-
-    The dashboard intentionally stores only five fields:
-      Branch, Designation, Company Code, Employment Type,
-      Retention Applicable.
-
-    Employment Type and Retention Applicable remain independently editable in
-    the UI. Computation applies hard safety rules afterwards: Non-Full Time is
-    always no deduction even if Retention Applicable was accidentally set Yes.
-    """
     if df is None:
         df = pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
-
     out = df.copy()
     for col in CUSTOMIZE_DASHBOARD_COLUMNS:
         if col not in out.columns:
             out[col] = None
-
     for col in ["Branch", "Designation", "Company Code"]:
         out[col] = out[col].apply(_retention_clean_text)
-
     out["Employment Type"] = out["Employment Type"].apply(normalise_retention_employment_type)
     out["Retention Applicable"] = out.apply(
         lambda row: normalise_retention_applicable(
@@ -550,35 +514,20 @@ def _prepare_customize_dashboard(df: pd.DataFrame) -> pd.DataFrame:
         ),
         axis=1,
     )
-
-    valid = (
-        out["Branch"].ne("")
-        & out["Company Code"].ne("")
-        & out["Designation"].ne("")
-    )
+    valid = out["Branch"].ne("") & out["Company Code"].ne("") & out["Designation"].ne("")
     out = out.loc[valid, CUSTOMIZE_DASHBOARD_COLUMNS].copy()
-
     if out.empty:
         return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
-
     out["__branch_key"] = _retention_normalise_key_series(out["Branch"])
     out["__cc_key"] = _retention_normalise_key_series(out["Company Code"])
     out["__designation_key"] = _retention_normalise_key_series(out["Designation"])
     out = out.drop_duplicates(
-        subset=["__branch_key", "__cc_key", "__designation_key"],
-        keep="last",
+        subset=["__branch_key", "__cc_key", "__designation_key"], keep="last"
     )
-    out = out.drop(columns=["__branch_key", "__cc_key", "__designation_key"])
-    return out.reset_index(drop=True)
+    return out.drop(columns=["__branch_key", "__cc_key", "__designation_key"]).reset_index(drop=True)
 
 
 def load_customize_dashboard() -> pd.DataFrame:
-    """Load the Retention Customize rule master.
-
-    Older saved rows are automatically migrated: Gig Worker / Consultant /
-    Contractual / Part Time become Non-Full Time, and any old extra columns
-    are ignored without breaking the file.
-    """
     if not os.path.exists(_CUSTOMIZE_DASHBOARD_FILE):
         return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
     try:
@@ -590,7 +539,6 @@ def load_customize_dashboard() -> pd.DataFrame:
 
 
 def save_customize_dashboard(df: pd.DataFrame):
-    """Persist the Retention Customize rule master."""
     os.makedirs(_DATA_DIR, exist_ok=True)
     out = _prepare_customize_dashboard(df)
     with open(_CUSTOMIZE_DASHBOARD_FILE, "w", encoding="utf-8") as f:
@@ -598,13 +546,10 @@ def save_customize_dashboard(df: pd.DataFrame):
 
 
 def sample_customize_dashboard_bulk_template() -> pd.DataFrame:
-    """Bulk upload contains only Branch, Company Code and Designation."""
-    return pd.DataFrame(
-        [
-            {"Branch": "Koramangala", "Company Code": "MAIN", "Designation": "Teacher"},
-            {"Branch": "Whitefield", "Company Code": "MAIN", "Designation": "Principal"},
-        ]
-    )
+    return pd.DataFrame([
+        {"Branch": "Koramangala", "Company Code": "MAIN", "Designation": "Teacher"},
+        {"Branch": "Whitefield", "Company Code": "MAIN", "Designation": "Principal"},
+    ])
 
 
 def merge_customize_dashboard_bulk_upload(
@@ -615,16 +560,8 @@ def merge_customize_dashboard_bulk_upload(
     cc_col: str = "Company Code",
     designation_col: str = "Designation",
 ) -> pd.DataFrame:
-    """Merge a three-column upload into the Customize rule master.
-
-    `erp_col` stays in the signature for compatibility with older callers but
-    is intentionally unused. Existing rules preserve their editable
-    Employment Type / Retention Applicable values. New rules default to
-    Full Time / Yes and can then be changed from the dropdown table.
-    """
     if upload_df is None:
         raise ValueError("Customize upload is empty.")
-
     required = [branch_col, cc_col, designation_col]
     missing = [c for c in required if c not in upload_df.columns]
     if missing:
@@ -647,7 +584,6 @@ def merge_customize_dashboard_bulk_upload(
         designation = _retention_clean_text(row.get(designation_col))
         if not branch or not company_code or not designation:
             continue
-
         key = (branch.upper(), company_code.upper(), designation.upper())
         prior = existing_map.get(key, {})
         employment_type = normalise_retention_employment_type(
@@ -656,15 +592,13 @@ def merge_customize_dashboard_bulk_upload(
         retention_applicable = normalise_retention_applicable(
             prior.get("Retention Applicable"), employment_type
         )
-        rows.append(
-            {
-                "Branch": branch,
-                "Designation": designation,
-                "Company Code": company_code,
-                "Employment Type": employment_type,
-                "Retention Applicable": retention_applicable,
-            }
-        )
+        rows.append({
+            "Branch": branch,
+            "Designation": designation,
+            "Company Code": company_code,
+            "Employment Type": employment_type,
+            "Retention Applicable": retention_applicable,
+        })
 
     uploaded = pd.DataFrame(rows, columns=CUSTOMIZE_DASHBOARD_COLUMNS)
     if uploaded.empty:
@@ -672,21 +606,20 @@ def merge_customize_dashboard_bulk_upload(
 
     def _add_key(frame):
         frame = frame.copy()
-        frame["__key"] = list(
-            zip(
-                _retention_normalise_key_series(frame["Branch"]),
-                _retention_normalise_key_series(frame["Company Code"]),
-                _retention_normalise_key_series(frame["Designation"]),
-            )
-        )
+        frame["__key"] = list(zip(
+            _retention_normalise_key_series(frame["Branch"]),
+            _retention_normalise_key_series(frame["Company Code"]),
+            _retention_normalise_key_series(frame["Designation"]),
+        ))
         return frame
 
     old = _add_key(existing)
     new = _add_key(uploaded)
     new_keys = set(new["__key"].tolist())
     untouched = old.loc[~old["__key"].isin(new_keys)].drop(columns="__key")
-    new = new.drop(columns="__key")
-    return _prepare_customize_dashboard(pd.concat([untouched, new], ignore_index=True))
+    return _prepare_customize_dashboard(
+        pd.concat([untouched, new.drop(columns="__key")], ignore_index=True)
+    )
 
 
 def upsert_customize_dashboard_rule(
@@ -697,35 +630,25 @@ def upsert_customize_dashboard_rule(
     employment_type: str = "Full Time",
     retention_applicable: str = "Yes",
 ) -> pd.DataFrame:
-    """Add or update one Branch + Company Code + Designation rule."""
     branch = _retention_clean_text(branch)
     designation = _retention_clean_text(designation)
     company_code = _retention_clean_text(company_code)
     if not branch or not designation or not company_code:
         raise ValueError("Branch, Designation and Company Code are required.")
-
-    one = pd.DataFrame(
-        [
-            {
-                "Branch": branch,
-                "Designation": designation,
-                "Company Code": company_code,
-                "Employment Type": normalise_retention_employment_type(employment_type),
-                "Retention Applicable": normalise_retention_applicable(
-                    retention_applicable, employment_type
-                ),
-            }
-        ]
-    )
-
-    existing = _prepare_customize_dashboard(existing_df)
-    combined = pd.concat([existing, one], ignore_index=True)
-    return _prepare_customize_dashboard(combined)
+    one = pd.DataFrame([{
+        "Branch": branch,
+        "Designation": designation,
+        "Company Code": company_code,
+        "Employment Type": normalise_retention_employment_type(employment_type),
+        "Retention Applicable": normalise_retention_applicable(retention_applicable, employment_type),
+    }])
+    return _prepare_customize_dashboard(pd.concat([
+        _prepare_customize_dashboard(existing_df), one
+    ], ignore_index=True))
 
 
 # --------------------------------------------------------------------------
-# Payroll cycle helper — retained for compatibility with other modules.
-# Retention Fund itself does NOT use this helper for eligibility.
+# General helpers retained for compatibility
 # --------------------------------------------------------------------------
 
 def get_payroll_cycle(reference_date=None) -> tuple:
@@ -734,7 +657,6 @@ def get_payroll_cycle(reference_date=None) -> tuple:
         reference_date = date.today()
     if isinstance(reference_date, datetime):
         reference_date = reference_date.date()
-
     if reference_date.day >= 26:
         cycle_start = date(reference_date.year, reference_date.month, 26)
         end_month = reference_date.month + 1
@@ -751,12 +673,10 @@ def get_payroll_cycle(reference_date=None) -> tuple:
             start_year -= 1
         cycle_start = date(start_year, start_month, 26)
         cycle_end = date(reference_date.year, reference_date.month, 25)
-
     return cycle_start, cycle_end
 
 
 def format_date_ddmmmyyyy(value) -> str:
-    """Format a date-like value as dd-mmm-yyyy; blank for invalid values."""
     if value is None:
         return ""
     try:
@@ -771,7 +691,6 @@ def format_date_ddmmmyyyy(value) -> str:
 
 
 def pending_deduction_sentence(label: str, pending_df: pd.DataFrame, name_col: str) -> str:
-    """Human-readable pending deduction summary."""
     count = len(pending_df)
     if count == 0:
         return f"**{label}**: No deductions pending."
@@ -781,19 +700,13 @@ def pending_deduction_sentence(label: str, pending_df: pd.DataFrame, name_col: s
     return f"**{label}**: {count} deductions pending."
 
 
-# --------------------------------------------------------------------------
-# Numeric coercion (same public helper retained)
-# --------------------------------------------------------------------------
-
 def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.Series:
     """Clean currency/text-formatted numeric columns and validate bad cells."""
     if pd.api.types.is_numeric_dtype(series):
         return pd.to_numeric(series, errors="coerce")
-
     cleaned = series.astype(str).str.replace(r"[₹$,\s]", "", regex=True).str.strip()
     cleaned = cleaned.replace({"": None, "nan": None, "None": None, "NaT": None})
     numeric = pd.to_numeric(cleaned, errors="coerce")
-
     original_nonblank = series.notna() & series.astype(str).str.strip().ne("")
     bad_mask = numeric.isna() & original_nonblank
     if bad_mask.any():
@@ -808,31 +721,27 @@ def coerce_numeric_column(series: pd.Series, column_name: str = "value") -> pd.S
 
 
 # --------------------------------------------------------------------------
-# Consolidated Paysheet templates / employee-master enrichment
+# Full-book paysheet parsing / employee-master enrichment
 # --------------------------------------------------------------------------
 
 def sample_consolidated_paysheet_template() -> pd.DataFrame:
-    """Required monthly paysheet format."""
-    return pd.DataFrame(
-        [
-            {"ERP": "E001", "First Hire Date": "2020-01-15", "Net Pay": 21000, "Monthly Gross": 25000},
-            {"ERP": "E002", "First Hire Date": "2021-06-10", "Net Pay": 31000, "Monthly Gross": 35000},
-            {"ERP": "E003", "First Hire Date": "2024-09-20", "Net Pay": 36000, "Monthly Gross": 40000},
-        ]
-    )
+    """Sample of the new single-file full-book format."""
+    return pd.DataFrame([
+        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-07", "Net Pay": 21000, "Monthly Gross": 25000},
+        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-08", "Net Pay": 21500, "Monthly Gross": 25000},
+        {"ERP": "E001", "First Hire Date": "2026-07-15", "Wage Month": "2026-09", "Net Pay": 22000, "Monthly Gross": 25000},
+        {"ERP": "E002", "First Hire Date": "2026-09-05", "Wage Month": "2026-09", "Net Pay": 900, "Monthly Gross": 15000},
+    ])
 
 
 def _retention_resolve_column(df: pd.DataFrame, aliases: list):
-    """Resolve a column using exact normalized aliases first, then substrings."""
-    if df is None or df.empty:
+    if df is None or len(df.columns) == 0:
         return None
-
     normalized = {str(c).strip().lower(): c for c in df.columns}
     for alias in aliases:
         key = str(alias).strip().lower()
         if key in normalized:
             return normalized[key]
-
     for col in df.columns:
         col_key = str(col).strip().lower()
         for alias in aliases:
@@ -842,61 +751,92 @@ def _retention_resolve_column(df: pd.DataFrame, aliases: list):
     return None
 
 
+def _parse_retention_date_value(value):
+    """Parse common Excel/date text values without treating YYYYMM as nanoseconds."""
+    if value is None:
+        return pd.NaT
+    try:
+        if pd.isna(value):
+            return pd.NaT
+    except Exception:
+        pass
+
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(value)
+
+    text = str(value).strip()
+    if not text:
+        return pd.NaT
+
+    # Common wage-month compact form: 202609.
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    if len(text) == 6 and text.isdigit():
+        year = int(text[:4])
+        month = int(text[4:])
+        if 1900 <= year <= 2200 and 1 <= month <= 12:
+            return pd.Timestamp(year=year, month=month, day=1)
+
+    # Excel serial date, when a sheet stores the raw serial rather than date formatting.
+    try:
+        numeric = float(text.replace(",", ""))
+        if 20000 <= numeric <= 80000:
+            return pd.Timestamp("1899-12-30") + pd.to_timedelta(int(numeric), unit="D")
+    except Exception:
+        pass
+
+    for fmt in (
+        "%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d",
+        "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+        "%Y-%m", "%Y/%m", "%b-%Y", "%b-%y", "%B-%Y", "%B-%y", "%m-%Y", "%m/%Y",
+    ):
+        try:
+            return pd.to_datetime(text, format=fmt)
+        except Exception:
+            pass
+
+    try:
+        return pd.to_datetime(text, errors="coerce", dayfirst=True)
+    except Exception:
+        return pd.NaT
+
+
+def parse_retention_date_series(series: pd.Series) -> pd.Series:
+    return series.apply(_parse_retention_date_value)
+
+
+def parse_wage_month_series(series: pd.Series) -> pd.Series:
+    parsed = parse_retention_date_series(series)
+    return parsed.dt.to_period("M").dt.to_timestamp()
+
+
 def normalise_employee_master(employee_master: pd.DataFrame = None) -> pd.DataFrame:
-    """Map the Employee Database to ERP/Branch/Designation/Company Code."""
     if employee_master is None or employee_master.empty:
         return pd.DataFrame(columns=EMPLOYEE_MASTER_COLUMNS)
-
     aliases = {
-        "ERP": [
-            "ERP", "Employee ID", "Employee Id", "Employee Code", "Emp Code",
-            "EmployeeCode", "Emp ID", "ERP Code",
-        ],
-        "Branch": [
-            "Branch", "Current Branch", "Curr.Branch", "Curr Branch", "Branch Name",
-            "Location", "Current Location",
-        ],
-        "Designation": [
-            "Designation", "Current Designation", "Curr.Designation", "Curr Designation",
-            "Role", "Job Title", "Position",
-        ],
-        "Company Code": [
-            "Company Code", "CompanyCode", "Comp Code", "Company", "Company_Code",
-            "Entity Code",
-        ],
+        "ERP": ["ERP", "Employee ID", "Employee Id", "Employee Code", "Emp Code", "EmployeeCode", "Emp ID", "ERP Code"],
+        "Branch": ["Branch", "Current Branch", "Curr.Branch", "Curr Branch", "Branch Name", "Location", "Current Location"],
+        "Designation": ["Designation", "Current Designation", "Curr.Designation", "Curr Designation", "Role", "Job Title", "Position"],
+        "Company Code": ["Company Code", "CompanyCode", "Comp Code", "Company", "Company_Code", "Entity Code"],
     }
-
-    resolved = {
-        name: _retention_resolve_column(employee_master, options)
-        for name, options in aliases.items()
-    }
+    resolved = {name: _retention_resolve_column(employee_master, options) for name, options in aliases.items()}
     missing = [name for name, source in resolved.items() if source is None]
     if missing:
         return pd.DataFrame(columns=EMPLOYEE_MASTER_COLUMNS)
-
     out = employee_master[[resolved[c] for c in EMPLOYEE_MASTER_COLUMNS]].copy()
     out.columns = EMPLOYEE_MASTER_COLUMNS
     out["ERP"] = out["ERP"].apply(_retention_clean_text)
     for col in ["Branch", "Designation", "Company Code"]:
         out[col] = out[col].apply(_retention_clean_text)
     out = out.loc[out["ERP"].ne("")]
-
     out["__erp_key"] = _retention_normalise_key_series(out["ERP"])
-    out = out.drop_duplicates(subset=["__erp_key"], keep="last")
-    return out.drop(columns="__erp_key").reset_index(drop=True)
+    return out.drop_duplicates("__erp_key", keep="last").drop(columns="__erp_key").reset_index(drop=True)
 
 
-def _attach_employee_profile(
-    paysheet: pd.DataFrame,
-    erp_col: str,
-    employee_master: pd.DataFrame = None,
-) -> pd.DataFrame:
+def _attach_employee_profile(paysheet: pd.DataFrame, erp_col: str, employee_master: pd.DataFrame = None) -> pd.DataFrame:
     out = paysheet.copy()
     out[erp_col] = out[erp_col].apply(_retention_clean_text)
     profile_columns = ["Branch", "Designation", "Company Code"]
-
-    # If source data already contains profile columns, keep them and only fill
-    # blanks from the central Employee Database.
     for col in profile_columns:
         if col not in out.columns:
             out[col] = ""
@@ -907,7 +847,6 @@ def _attach_employee_profile(
         master = master.copy()
         master["__erp_key"] = _retention_normalise_key_series(master["ERP"])
         master = master.drop_duplicates("__erp_key", keep="last").set_index("__erp_key")
-
         erp_keys = _retention_normalise_key_series(out[erp_col])
         for col in profile_columns:
             mapped = erp_keys.map(master[col])
@@ -915,20 +854,14 @@ def _attach_employee_profile(
             out.loc[blank, col] = mapped.loc[blank].fillna("")
 
     out["Employee Master Mapping Missing"] = (
-        out["Branch"].eq("")
-        | out["Designation"].eq("")
-        | out["Company Code"].eq("")
+        out["Branch"].eq("") | out["Designation"].eq("") | out["Company Code"].eq("")
     )
     return out
 
 
-def _attach_customize_rule(
-    out: pd.DataFrame,
-    customize_dashboard: pd.DataFrame = None,
-) -> pd.DataFrame:
+def _attach_customize_rule(out: pd.DataFrame, customize_dashboard: pd.DataFrame = None) -> pd.DataFrame:
     rules = _prepare_customize_dashboard(customize_dashboard)
     result = out.copy()
-
     result["__branch_key"] = _retention_normalise_key_series(result["Branch"])
     result["__cc_key"] = _retention_normalise_key_series(result["Company Code"])
     result["__designation_key"] = _retention_normalise_key_series(result["Designation"])
@@ -944,17 +877,11 @@ def _attach_customize_rule(
     rules["__cc_key"] = _retention_normalise_key_series(rules["Company Code"])
     rules["__designation_key"] = _retention_normalise_key_series(rules["Designation"])
     rules["Customize Rule Matched"] = True
-
-    rule_columns = [
-        "__branch_key",
-        "__cc_key",
-        "__designation_key",
-        "Employment Type",
-        "Retention Applicable",
-        "Customize Rule Matched",
-    ]
     result = result.merge(
-        rules[rule_columns],
+        rules[[
+            "__branch_key", "__cc_key", "__designation_key",
+            "Employment Type", "Retention Applicable", "Customize Rule Matched",
+        ]],
         on=["__branch_key", "__cc_key", "__designation_key"],
         how="left",
     )
@@ -962,8 +889,396 @@ def _attach_customize_rule(
     return result.drop(columns=["__branch_key", "__cc_key", "__designation_key"])
 
 
+def _retention_month_difference(wage_month: pd.Series, first_hire_date: pd.Series) -> pd.Series:
+    wage_num = wage_month.dt.year * 12 + wage_month.dt.month
+    hire_num = first_hire_date.dt.year * 12 + first_hire_date.dt.month
+    return wage_num - hire_num
+
+
+def _deduction_stage_from_index(month_index):
+    if pd.isna(month_index):
+        return ""
+    try:
+        month_index = int(month_index)
+    except Exception:
+        return ""
+    return {
+        0: "First Month Deduction",
+        1: "Second Month Deduction",
+        2: "Final Month Deduction",
+    }.get(month_index, "")
+
+
+def _retention_exclusion_reason(row) -> str:
+    """Return the first business-rule reason that blocks retention eligibility."""
+    if row.get("Employee Master Mapping Missing", False):
+        return "Employee Master Mapping Missing"
+    if row.get("Company Code Excluded", False):
+        return "Excluded Company Code"
+    if row.get("Exceptional ERP", False):
+        return "Exceptional ERP"
+    if not row.get("Customize Rule Matched", False):
+        return "Customize Rule Missing"
+    if normalise_retention_employment_type(row.get("Employment Type")) != "Full Time":
+        return "Non-Full Time"
+    if str(row.get("Retention Applicable", "")).strip().lower() != "yes":
+        return "Retention Not Applicable"
+    return "Eligible"
+
+
 # --------------------------------------------------------------------------
-# Core Retention Fund computation
+# New primary engine: one full-book paysheet with Wage Month per row
+# --------------------------------------------------------------------------
+
+def process_retention_paysheet(
+    paysheet_df: pd.DataFrame,
+    exceptional_erps: list = None,
+    customize_dashboard: pd.DataFrame = None,
+    employee_master: pd.DataFrame = None,
+    ignored_company_codes: list = None,
+    release_days: int = 340,
+    release_review_date=None,
+    deduction_pct: float = 10.0,
+) -> tuple:
+    """Process one retention full book and return (ERP summary, row detail).
+
+    Required source columns after standardization:
+      ERP, First Hire Date, Wage Month, Net Pay, Monthly Gross
+
+    The source may contain many Wage Months and many rows per ERP, but only one
+    row per ERP + Wage Month is allowed. The earliest valid First Hire Date in
+    the uploaded full book becomes the canonical First Hire Date for that ERP.
+
+    Deduction is calculated only for employment month indexes 0, 1 and 2
+    (First, Second and Final Month Deduction). The calculated deduction count
+    therefore comes from the uploaded historical full book rather than from
+    employee age alone.
+    """
+    if paysheet_df is None or paysheet_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if float(deduction_pct) != 10.0:
+        raise ValueError("Retention Fund deduction percentage must be exactly 10%.")
+    try:
+        release_days = int(release_days)
+    except Exception:
+        raise ValueError("Release days must be a whole number.")
+    if release_days < 0:
+        raise ValueError("Release days cannot be negative.")
+
+    review_date = pd.Timestamp(release_review_date or date.today()).normalize()
+    required = list(CONSOLIDATED_PAYSHEET_COLUMNS)
+    missing = [c for c in required if c not in paysheet_df.columns]
+    if missing:
+        raise ValueError(f"Paysheet is missing required column(s): {', '.join(missing)}")
+
+    out = paysheet_df.copy()
+    out["ERP"] = out["ERP"].apply(_retention_clean_text)
+    if out["ERP"].eq("").any():
+        raise ValueError("ERP cannot be blank in the Retention Full Book.")
+
+    out["Uploaded First Hire Date"] = parse_retention_date_series(out["First Hire Date"])
+    out["Wage Month"] = parse_wage_month_series(out["Wage Month"])
+    out["Wage Month Valid"] = out["Wage Month"].notna()
+
+    # Canonical FHD = earliest valid FHD for each ERP in the uploaded book.
+    out["__erp_key"] = _retention_normalise_key_series(out["ERP"])
+    valid_hire = out.dropna(subset=["Uploaded First Hire Date"])
+    canonical_hire = valid_hire.groupby("__erp_key")["Uploaded First Hire Date"].min()
+    distinct_hire = valid_hire.groupby("__erp_key")["Uploaded First Hire Date"].nunique()
+    out["First Hire Date"] = out["__erp_key"].map(canonical_hire)
+    out["First Hire Date Valid"] = out["First Hire Date"].notna()
+    out["First Hire Date Variance"] = out["__erp_key"].map(distinct_hire.gt(1)).fillna(False).astype(bool)
+    out["First Hire Date Recovered"] = out["Uploaded First Hire Date"].isna() & out["First Hire Date Valid"]
+
+    valid_pair = out["Wage Month Valid"]
+    duplicate_pair = out.loc[valid_pair].duplicated(subset=["__erp_key", "Wage Month"], keep=False)
+    if duplicate_pair.any():
+        bad = out.loc[valid_pair].loc[duplicate_pair, ["ERP", "Wage Month"]].head(10).copy()
+        bad["Wage Month"] = bad["Wage Month"].dt.strftime("%b-%Y")
+        examples = ", ".join(f"{r['ERP']} ({r['Wage Month']})" for _, r in bad.iterrows())
+        raise ValueError(
+            "The full book contains more than one row for the same ERP and Wage Month: " + examples
+        )
+
+    out["Monthly Gross"] = coerce_numeric_column(out["Monthly Gross"], "Monthly Gross")
+    out["Net Pay"] = coerce_numeric_column(out["Net Pay"], "Net Pay")
+    out["Financial Data Valid"] = (
+        out["Monthly Gross"].notna() & out["Net Pay"].notna()
+        & out["Monthly Gross"].ge(0) & out["Net Pay"].ge(0)
+    )
+
+    out = _attach_employee_profile(out, "ERP", employee_master)
+
+    exceptional_set = {
+        _retention_clean_text(v).upper()
+        for v in (exceptional_erps or []) if _retention_clean_text(v)
+    }
+    ignored_cc_set = {
+        _retention_clean_text(v).upper()
+        for v in (ignored_company_codes or []) if _retention_clean_text(v)
+    }
+    out["Exceptional ERP"] = out["ERP"].str.upper().isin(exceptional_set)
+    out["Company Code Excluded"] = (
+        out["Company Code"].fillna("").astype(str).str.strip().str.upper().isin(ignored_cc_set)
+    )
+    out = _attach_customize_rule(out, customize_dashboard)
+    out["Eligibility Reason"] = out.apply(_retention_exclusion_reason, axis=1)
+    out["Retention Eligible"] = out["Eligibility Reason"].eq("Eligible")
+
+    out["Employment Month Index"] = _retention_month_difference(out["Wage Month"], out["First Hire Date"])
+    out["Employment Month Number"] = (out["Employment Month Index"] + 1).where(
+        out["Employment Month Index"].notna() & out["Employment Month Index"].ge(0)
+    ).astype("Int64")
+    out["Within Initial 3 Months"] = out["Employment Month Index"].between(0, 2, inclusive="both").fillna(False)
+    out["Deduction Stage"] = out["Employment Month Index"].apply(_deduction_stage_from_index)
+
+    out["10% of Gross"] = out["Monthly Gross"] * 0.10
+    out["Deduction Applicable"] = (
+        out["Retention Eligible"]
+        & out["First Hire Date Valid"]
+        & out["Wage Month Valid"]
+        & out["Within Initial 3 Months"]
+        & out["Financial Data Valid"]
+    )
+    out["Deduction Amount"] = 0.0
+    applicable = out["Deduction Applicable"]
+    if applicable.any():
+        out.loc[applicable, "Deduction Amount"] = out.loc[
+            applicable, ["10% of Gross", "Net Pay"]
+        ].min(axis=1).clip(lower=0)
+
+    out["Expected Release Date"] = out["First Hire Date"] + pd.to_timedelta(release_days, unit="D")
+    out["Release Days Policy"] = release_days
+    out["Release Review Date"] = review_date
+
+    valid_wage_months = out.loc[out["Wage Month Valid"], "Wage Month"]
+    current_payroll_month = valid_wage_months.max() if not valid_wage_months.empty else pd.NaT
+    out["Current Payroll Month"] = current_payroll_month
+    out["Current Payroll Row"] = out["Wage Month"].eq(current_payroll_month) if pd.notna(current_payroll_month) else False
+    first_hire_month = out["First Hire Date"].dt.to_period("M").dt.to_timestamp()
+    out["New Joiner in Current Payroll"] = (
+        out["Current Payroll Row"] & first_hire_month.eq(current_payroll_month)
+    )
+
+    def _row_status(row):
+        if not row["First Hire Date Valid"]:
+            return "Invalid First Hire Date"
+        if not row["Wage Month Valid"]:
+            return "Invalid Wage Month"
+        if row["Employment Month Index"] < 0:
+            return "Before First Hire Month"
+        if row["Company Code Excluded"]:
+            return "Excluded Company Code - No Deduction"
+        if row["Exceptional ERP"]:
+            return "Exceptional ERP - No Deduction"
+        if row["Employee Master Mapping Missing"]:
+            return "Employee Master Mapping Missing"
+        if not row["Customize Rule Matched"]:
+            return "Customize Rule Missing"
+        if normalise_retention_employment_type(row.get("Employment Type")) != "Full Time":
+            return "Non-Full Time - No Deduction"
+        if str(row.get("Retention Applicable", "")).strip().lower() != "yes":
+            return "Retention Not Applicable - No Deduction"
+        if row["Employment Month Index"] > 2:
+            return "Initial 3 Deductions Completed / No Further Deduction"
+        if not row["Financial Data Valid"]:
+            return "Invalid Pay Data"
+        if row["Deduction Amount"] <= 0:
+            return f"{row['Deduction Stage']} - Zero Eligible Amount" if row["Deduction Stage"] else "No Deduction"
+        return row["Deduction Stage"]
+
+    out["Status"] = out.apply(_row_status, axis=1)
+    out["Final Retention Remark"] = out["Status"]
+    out["Deduction Occurred"] = out["Deduction Amount"].gt(0)
+
+    out = out.sort_values(["__erp_key", "Wage Month"], na_position="last").reset_index(drop=True)
+    out["Cumulative Deduction Count"] = out.groupby("__erp_key")["Deduction Occurred"].cumsum().astype(int)
+    out["Cumulative Retention Held"] = out.groupby("__erp_key")["Deduction Amount"].cumsum()
+    out["First Hire Month"] = out["First Hire Date"].dt.to_period("M").astype("string")
+
+    # Make the monthly retention sequence explicit in the ledger.  The stage is
+    # determined from First Hire Date vs Wage Month, while the count is the
+    # number of positive deductions actually reconstructed from the uploaded
+    # full book up to that Wage Month.
+    out["Deduction Count After Wage Month"] = out["Cumulative Deduction Count"]
+
+    # Once an employee is past employment month 3, do not imply that all three
+    # deductions were completed unless the reconstructed count really is 3/3.
+    # This is important for old joiners whose uploaded full book contains only
+    # one or two of the expected initial-month deductions.
+    initial_window_passed = (
+        out["Retention Eligible"]
+        & out["Employment Month Index"].gt(2)
+        & out["First Hire Date Valid"]
+        & out["Wage Month Valid"]
+    )
+    completed_three = initial_window_passed & out["Cumulative Deduction Count"].ge(3)
+    incomplete_three = initial_window_passed & out["Cumulative Deduction Count"].lt(3)
+    out.loc[completed_three, "Status"] = "3/3 Deductions Completed - No Further Deduction"
+    out.loc[incomplete_three, "Status"] = out.loc[incomplete_three, "Cumulative Deduction Count"].apply(
+        lambda count: f"Initial 3-Month Window Passed - {int(count)}/3 Deductions Found"
+    )
+    out["Final Retention Remark"] = out["Status"]
+
+    out["Deduction Sequence Remark"] = out.apply(
+        lambda row: (
+            f"{row['Deduction Stage']} | Deduction count {int(row['Cumulative Deduction Count'])}/3"
+            if bool(row.get("Deduction Occurred", False)) and row.get("Deduction Stage")
+            else str(row.get("Status", ""))
+        ),
+        axis=1,
+    )
+
+    # Compatibility alias for older report/UI code.
+    out["Paysheet Month"] = out["Wage Month"]
+
+    summary_rows = []
+    for erp_key, group in out.groupby("__erp_key", sort=True):
+        group = group.sort_values("Wage Month", na_position="last")
+        latest = group.iloc[-1]
+        current_rows = group.loc[group["Current Payroll Row"]]
+        current = current_rows.iloc[-1] if not current_rows.empty else None
+        deduction_rows = group.loc[group["Deduction Occurred"]].copy()
+        deduction_count = int(len(deduction_rows))
+        total_held = float(deduction_rows["Deduction Amount"].sum())
+        expected_release = group["Expected Release Date"].dropna().min() if group["Expected Release Date"].notna().any() else pd.NaT
+        first_hire_date = group["First Hire Date"].dropna().min() if group["First Hire Date"].notna().any() else pd.NaT
+
+        # Base eligibility is employee/rule based, independent of which wage month row is latest.
+        eligible_rows = group.loc[group["Retention Eligible"]]
+        base_eligible = not eligible_rows.empty
+        eligibility_reason = "Eligible" if base_eligible else str(latest.get("Eligibility Reason", "Not Eligible"))
+
+        if pd.isna(expected_release):
+            days_until_release = None
+        else:
+            days_until_release = int((pd.Timestamp(expected_release).normalize() - review_date).days)
+
+        release_date_reached = bool(
+            pd.notna(expected_release)
+            and review_date >= pd.Timestamp(expected_release).normalize()
+        )
+
+        # Release / Hold logic:
+        #   Release Due -> exactly 3 reconstructed deductions + release date reached.
+        #   Hold        -> 1/3, 2/3 or 3/3 deductions and release date is still pending.
+        #   Review      -> release date reached but fewer than 3 deductions were found.
+        # This keeps "Hold Cases" aligned to the business definition supplied by
+        # payroll while still surfacing incomplete historical deductions safely.
+        if not base_eligible:
+            release_status = "Not Applicable"
+            release_remark = f"No release tracking - {eligibility_reason}"
+        elif deduction_count == 3 and release_date_reached:
+            release_status = "Release Due"
+            release_remark = (
+                "3/3 deductions completed and First Hire Date + release days has been reached."
+            )
+        elif deduction_count in (1, 2, 3) and not release_date_reached:
+            release_status = f"Hold - {deduction_count}/3 Deductions; Release Date Pending"
+            release_remark = (
+                f"{deduction_count}/3 deductions completed; hold until "
+                f"{format_date_ddmmmyyyy(expected_release)}."
+            )
+        elif deduction_count < 3 and release_date_reached:
+            release_status = f"Review Required - {deduction_count}/3 Deductions"
+            release_remark = (
+                f"Release date has been reached, but only {deduction_count}/3 deductions "
+                "were reconstructed from the uploaded Retention Full Book."
+            )
+        else:
+            release_status = "No Deduction Yet"
+            release_remark = (
+                "Eligible employee, but no positive retention deduction has been reconstructed yet."
+            )
+
+        stage_amounts = {}
+        stage_months = {}
+        for stage in ["First Month Deduction", "Second Month Deduction", "Final Month Deduction"]:
+            stage_rows = group.loc[group["Deduction Stage"].eq(stage)]
+            stage_amounts[stage] = float(stage_rows["Deduction Amount"].sum()) if not stage_rows.empty else 0.0
+            valid_stage_months = stage_rows["Wage Month"].dropna()
+            stage_months[stage] = valid_stage_months.min() if not valid_stage_months.empty else pd.NaT
+
+        first_deduction_month = deduction_rows["Wage Month"].min() if not deduction_rows.empty else pd.NaT
+        final_deduction_month = deduction_rows["Wage Month"].max() if not deduction_rows.empty else pd.NaT
+
+        current_deduction_count = (
+            int(current.get("Cumulative Deduction Count", 0))
+            if current is not None else deduction_count
+        )
+        if current is None:
+            current_payroll_action = "No Current Payroll Row"
+        elif bool(current.get("Deduction Occurred", False)):
+            current_payroll_action = (
+                f"Deduct - {current.get('Deduction Stage', 'Retention Deduction')} "
+                f"({current_deduction_count}/3)"
+            )
+        elif deduction_count >= 3 and current.get("Employment Month Index") is not None:
+            current_payroll_action = "No Deduction - 3/3 Deductions Already Completed"
+        else:
+            current_payroll_action = str(current.get("Status", "No Deduction"))
+
+        summary_rows.append({
+            "ERP": latest["ERP"],
+            "First Hire Date": first_hire_date,
+            "First Hire Date Variance": bool(group["First Hire Date Variance"].max()),
+            "First Hire Date Recovered": bool(group["First Hire Date Recovered"].max()),
+            "Branch": latest.get("Branch", ""),
+            "Designation": latest.get("Designation", ""),
+            "Company Code": latest.get("Company Code", ""),
+            "Employment Type": latest.get("Employment Type", ""),
+            "Retention Applicable": latest.get("Retention Applicable", ""),
+            "Retention Eligibility": eligibility_reason,
+            "Company Code Excluded": bool(group["Company Code Excluded"].max()),
+            "Exceptional ERP": bool(group["Exceptional ERP"].max()),
+            "Current Payroll Month": current_payroll_month,
+            "Current Payroll Row Available": current is not None,
+            "New Joiner in Current Payroll": bool(group["New Joiner in Current Payroll"].max()),
+            "Current Payroll Deduction Stage": (
+                current.get("Deduction Stage", "")
+                if current is not None and float(current.get("Deduction Amount", 0.0)) > 0
+                else (current.get("Status", "") if current is not None else "No Current Payroll Row")
+            ),
+            "Current Payroll Action": current_payroll_action,
+            "Current Payroll Deduction Amount": float(current.get("Deduction Amount", 0.0)) if current is not None else 0.0,
+            "Current Payroll Deduction Count": current_deduction_count,
+            "Deduction Count": deduction_count,
+            "Deduction Progress": f"{min(deduction_count, 3)}/3",
+            "3 Deductions Completed": deduction_count == 3,
+            "First Month Deduction Amount": stage_amounts["First Month Deduction"],
+            "Second Month Deduction Amount": stage_amounts["Second Month Deduction"],
+            "Final Month Deduction Amount": stage_amounts["Final Month Deduction"],
+            "First Month Wage Month": stage_months["First Month Deduction"],
+            "Second Month Wage Month": stage_months["Second Month Deduction"],
+            "Final Month Wage Month": stage_months["Final Month Deduction"],
+            "First Deduction Month": first_deduction_month,
+            "Final Deduction Month": final_deduction_month,
+            "Months Processed": int(group["Wage Month"].nunique()),
+            "Months With Deduction": deduction_count,
+            "Total Retention Held": total_held,
+            "Total Deduction Accumulated": total_held,
+            "Expected Release Date": expected_release,
+            "Release Days Policy": release_days,
+            "Release Review Date": review_date,
+            "Release Date Reached": release_date_reached,
+            "Days Until Release": days_until_release,
+            "Release Amount": total_held if release_status == "Release Due" else 0.0,
+            "Hold Amount": total_held if release_status.startswith("Hold") else 0.0,
+            "Review Amount": total_held if release_status.startswith("Review Required") else 0.0,
+            "Release Status": release_status,
+            "Release / Hold Remark": release_remark,
+            "Latest Status": latest.get("Status", ""),
+        })
+
+    summary = pd.DataFrame(summary_rows)
+    if not summary.empty:
+        summary = summary.sort_values(["Release Status", "ERP"]).reset_index(drop=True)
+    out = out.drop(columns=["__erp_key"])
+    return summary, out
+
+
+# --------------------------------------------------------------------------
+# Compatibility wrappers for the prior monthly-file implementation
 # --------------------------------------------------------------------------
 
 def compute_paysheet_deduction(
@@ -979,190 +1294,30 @@ def compute_paysheet_deduction(
     employee_master: pd.DataFrame = None,
     ignored_company_codes: list = None,
 ) -> pd.DataFrame:
-    """Compute Retention Fund for one monthly paysheet.
-
-    The `ignored_company_codes` argument is appended at the end so older
-    callers using the previous function signature continue to work.
-
-    Deduction is allowed only when ALL are true:
-      * valid First Hire Date and paysheet month is on/after First Hire month
-      * ERP is not Exceptional
-      * mapped Company Code is not in the excluded Company Code list
-      * Branch + Company Code + Designation has a Customize rule
-      * Employment Type = Full Time
-      * Retention Applicable = Yes
-      * Monthly Gross and Net Pay are valid non-negative numbers
-    """
+    """Backward-compatible one-month wrapper around the full-book engine."""
     required = [erp_col, first_hire_col, net_pay_col, gross_col]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Paysheet is missing required column(s): {', '.join(missing)}")
-
-    if float(deduction_pct) != 10.0:
-        raise ValueError("Retention Fund deduction percentage must be exactly 10%.")
-
-    out = df.copy()
-    out[erp_col] = out[erp_col].apply(_retention_clean_text)
-    if out[erp_col].eq("").any():
-        raise ValueError("ERP cannot be blank in a paysheet.")
-
-    erp_key = out[erp_col].str.upper()
-    if erp_key.duplicated().any():
-        duplicates = out.loc[
-            erp_key.duplicated(keep=False), erp_col
-        ].astype(str).head(10).tolist()
-        raise ValueError(
-            "Duplicate ERP(s) found in the same monthly paysheet: " + ", ".join(duplicates)
-        )
-
-    out[gross_col] = coerce_numeric_column(out[gross_col], gross_col)
-    out[net_pay_col] = coerce_numeric_column(out[net_pay_col], net_pay_col)
-
-    out["First Hire Date"] = pd.to_datetime(out[first_hire_col], errors="coerce")
-    out["First Hire Date Valid"] = out["First Hire Date"].notna()
-
-    month_ts = pd.Timestamp(paysheet_month).to_period("M").to_timestamp()
-    out["Paysheet Month"] = month_ts
-    hire_month = out["First Hire Date"].dt.to_period("M")
-    out["Hired By This Month"] = (
-        out["First Hire Date Valid"]
-        & (hire_month <= month_ts.to_period("M"))
-    )
-
-    exceptional_set = {
-        _retention_clean_text(v).upper()
-        for v in (exceptional_erps or [])
-        if _retention_clean_text(v)
-    }
-    out["Exceptional ERP"] = out[erp_col].str.upper().isin(exceptional_set)
-
-    out = _attach_employee_profile(
-        out,
-        erp_col=erp_col,
-        employee_master=employee_master,
-    )
-
-    ignored_cc_set = {
-        _retention_clean_text(v).upper()
-        for v in (ignored_company_codes or [])
-        if _retention_clean_text(v)
-    }
-    out["Company Code Excluded"] = (
-        out["Company Code"].fillna("").astype(str).str.strip().str.upper().isin(ignored_cc_set)
-    )
-
-    out = _attach_customize_rule(
-        out,
+    work = df.copy()
+    work = work.rename(columns={
+        erp_col: "ERP",
+        first_hire_col: "First Hire Date",
+        net_pay_col: "Net Pay",
+        gross_col: "Monthly Gross",
+    })
+    work["Wage Month"] = pd.Timestamp(paysheet_month).to_period("M").to_timestamp()
+    _, detail = process_retention_paysheet(
+        work[CONSOLIDATED_PAYSHEET_COLUMNS],
+        exceptional_erps=exceptional_erps,
         customize_dashboard=customize_dashboard,
+        employee_master=employee_master,
+        ignored_company_codes=ignored_company_codes,
+        release_days=340,
+        release_review_date=date.today(),
+        deduction_pct=deduction_pct,
     )
-
-    out["Financial Data Valid"] = (
-        out[gross_col].notna()
-        & out[net_pay_col].notna()
-        & out[gross_col].ge(0)
-        & out[net_pay_col].ge(0)
-    )
-
-    out["10% of Gross"] = out[gross_col] * 0.10
-
-    employment_type = (
-        out["Employment Type"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .str.lower()
-    )
-    full_time = employment_type.eq("full time")
-
-    retention_yes = (
-        out["Retention Applicable"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .str.lower()
-        .eq("yes")
-    )
-
-    out["Deduction Applicable"] = (
-        out["First Hire Date Valid"]
-        & out["Hired By This Month"]
-        & ~out["Exceptional ERP"]
-        & ~out["Company Code Excluded"]
-        & ~out["Employee Master Mapping Missing"]
-        & out["Customize Rule Matched"]
-        & full_time
-        & retention_yes
-        & out["Financial Data Valid"]
-    )
-
-    out["Deduction Amount"] = 0.0
-    applicable = out["Deduction Applicable"]
-    if applicable.any():
-        # Exact business formula: min(10% of Monthly Gross, Net Pay).
-        out.loc[applicable, "Deduction Amount"] = out.loc[
-            applicable, ["10% of Gross", net_pay_col]
-        ].min(axis=1)
-
-    def _status(row):
-        if not row["First Hire Date Valid"]:
-            return "Invalid First Hire Date"
-        if not row["Hired By This Month"]:
-            return "Before First Hire Month"
-        if row["Exceptional ERP"]:
-            return "Exceptional ERP - No Deduction"
-        if row["Employee Master Mapping Missing"]:
-            return "Employee Master Mapping Missing"
-        if row["Company Code Excluded"]:
-            return "Excluded Company Code - No Deduction"
-        if not row["Customize Rule Matched"]:
-            return "Customize Rule Missing"
-        if normalise_retention_employment_type(row.get("Employment Type")) != "Full Time":
-            return "Non-Full Time - No Deduction"
-        if str(row.get("Retention Applicable", "")).strip().lower() != "yes":
-            return "Retention Not Applicable - No Deduction"
-        if not row["Financial Data Valid"]:
-            return "Invalid Pay Data"
-        if row["Deduction Amount"] <= 0:
-            return "No Deduction - Zero Eligible Amount"
-        return "Pending Release"
-
-    def _rule_remark(row):
-        if not row.get("Customize Rule Matched", False):
-            return "Rule Not Available"
-        if normalise_retention_employment_type(row.get("Employment Type")) != "Full Time":
-            return "No Deduction - Non-Full Time"
-        if str(row.get("Retention Applicable", "")).strip().lower() != "yes":
-            return "No Deduction - Retention Not Applicable"
-        return "Retention Eligible - Full Time"
-
-    def _final_remark(row):
-        if not row["First Hire Date Valid"]:
-            return "No Deduction - Invalid First Hire Date"
-        if not row["Hired By This Month"]:
-            return "No Deduction - Before First Hire Month"
-        if row["Exceptional ERP"]:
-            return "No Deduction - Exceptional ERP"
-        if row["Employee Master Mapping Missing"]:
-            return "No Deduction - Employee Mapping Missing"
-        if row["Company Code Excluded"]:
-            return "No Deduction - Excluded Company Code"
-        if not row["Customize Rule Matched"]:
-            return "No Deduction - Customize Rule Missing"
-        if normalise_retention_employment_type(row.get("Employment Type")) != "Full Time":
-            return "No Deduction - Non-Full Time"
-        if str(row.get("Retention Applicable", "")).strip().lower() != "yes":
-            return "No Deduction - Retention Not Applicable"
-        if not row["Financial Data Valid"]:
-            return "No Deduction - Invalid Pay Data"
-        if row["Deduction Amount"] <= 0:
-            return "No Deduction - Zero Eligible Amount"
-        return "Retention Deducted"
-
-    out["Retention Remarks"] = out.apply(_rule_remark, axis=1)
-    out["Status"] = out.apply(_status, axis=1)
-    out["Final Retention Remark"] = out.apply(_final_remark, axis=1)
-    out["First Hire Month"] = out["First Hire Date"].dt.to_period("M").astype("string")
-    return out
+    return detail
 
 
 def process_consolidated_paysheets(
@@ -1172,20 +1327,12 @@ def process_consolidated_paysheets(
     employee_master: pd.DataFrame = None,
     deduction_pct: float = 10.0,
     ignored_company_codes: list = None,
+    release_days: int = 340,
+    release_review_date=None,
 ) -> tuple:
-    """Process several monthly paysheets using one canonical First Hire Date.
-
-    `ignored_company_codes` is appended to preserve compatibility with older
-    callers. The earliest valid First Hire Date found for each ERP across the
-    uploaded months becomes the canonical First Hire Date.
-    """
-    if float(deduction_pct) != 10.0:
-        raise ValueError("Retention Fund deduction percentage must be exactly 10%.")
-
-    prepared = []
-    hire_rows = []
-
-    for item in monthly_inputs:
+    """Backward-compatible wrapper that stacks old monthly inputs into one full book."""
+    rows = []
+    for item in monthly_inputs or []:
         if isinstance(item, dict):
             month = item.get("month")
             data = item.get("data")
@@ -1194,153 +1341,66 @@ def process_consolidated_paysheets(
             month = item[0]
             data = item[1]
             source = item[2] if len(item) > 2 else ""
-
         if data is None or data.empty:
             continue
-
-        missing = [c for c in CONSOLIDATED_PAYSHEET_COLUMNS if c not in data.columns]
-        if missing:
-            raise ValueError(
-                f"{source or 'Paysheet'} is missing required column(s): {', '.join(missing)}"
-            )
-
         work = data.copy()
-        work["ERP"] = work["ERP"].apply(_retention_clean_text)
-        if work["ERP"].eq("").any():
-            raise ValueError(f"{source or 'Paysheet'} contains a blank ERP.")
-
-        work["__erp_key"] = work["ERP"].str.upper()
-        work["__uploaded_first_hire"] = pd.to_datetime(
-            work["First Hire Date"], errors="coerce"
-        )
-
-        hire_rows.append(work[["__erp_key", "__uploaded_first_hire"]].copy())
-        prepared.append({"month": month, "data": work, "source": source})
-
-    if not prepared:
+        # Accept the old 4-column standardized shape.
+        old_required = ["ERP", "First Hire Date", "Net Pay", "Monthly Gross"]
+        missing = [c for c in old_required if c not in work.columns]
+        if missing:
+            raise ValueError(f"{source or 'Paysheet'} is missing required column(s): {', '.join(missing)}")
+        work["Wage Month"] = pd.Timestamp(month).to_period("M").to_timestamp()
+        rows.append(work[CONSOLIDATED_PAYSHEET_COLUMNS])
+    if not rows:
         return pd.DataFrame(), pd.DataFrame()
-
-    all_hires = pd.concat(hire_rows, ignore_index=True)
-    valid_hires = all_hires.dropna(subset=["__uploaded_first_hire"])
-
-    canonical = valid_hires.groupby("__erp_key")["__uploaded_first_hire"].min()
-    distinct_dates = valid_hires.groupby("__erp_key")["__uploaded_first_hire"].nunique()
-    variance_map = distinct_dates.gt(1).to_dict()
-
-    monthly_results = []
-    for item in prepared:
-        work = item["data"].copy()
-        work["Uploaded First Hire Date"] = work["__uploaded_first_hire"]
-        work["First Hire Date"] = work["__erp_key"].map(canonical)
-        work["First Hire Date Variance"] = (
-            work["__erp_key"].map(variance_map).fillna(False).astype(bool)
-        )
-        work["First Hire Date Recovered"] = (
-            work["__uploaded_first_hire"].isna()
-            & work["First Hire Date"].notna()
-        )
-        work = work.drop(columns=["__uploaded_first_hire", "__erp_key"])
-
-        result = compute_paysheet_deduction(
-            work,
-            erp_col="ERP",
-            first_hire_col="First Hire Date",
-            net_pay_col="Net Pay",
-            gross_col="Monthly Gross",
-            paysheet_month=item["month"],
-            exceptional_erps=exceptional_erps,
-            customize_dashboard=customize_dashboard,
-            deduction_pct=10.0,
-            employee_master=employee_master,
-            ignored_company_codes=ignored_company_codes,
-        )
-        result["Source File"] = item["source"]
-        monthly_results.append(result)
-
-    return consolidate_paysheet_months(monthly_results, erp_col="ERP")
+    full_book = pd.concat(rows, ignore_index=True)
+    return process_retention_paysheet(
+        full_book,
+        exceptional_erps=exceptional_erps,
+        customize_dashboard=customize_dashboard,
+        employee_master=employee_master,
+        ignored_company_codes=ignored_company_codes,
+        release_days=release_days,
+        release_review_date=release_review_date,
+        deduction_pct=deduction_pct,
+    )
 
 
 def consolidate_paysheet_months(monthly_results: list, erp_col: str = "ERP") -> tuple:
-    """Return (ERP-level summary, month-wise consolidated detail)."""
+    """Compatibility aggregator for callers that already computed monthly results."""
     if not monthly_results:
         return pd.DataFrame(), pd.DataFrame()
-
     combined = pd.concat(monthly_results, ignore_index=True)
-    combined["Paysheet Month"] = (
-        pd.to_datetime(combined["Paysheet Month"])
-        .dt.to_period("M")
-        .dt.to_timestamp()
-    )
-
-    duplicate_pair = combined.duplicated(
-        subset=[erp_col, "Paysheet Month"],
-        keep=False,
-    )
-    if duplicate_pair.any():
-        examples = combined.loc[
-            duplicate_pair, [erp_col, "Paysheet Month"]
-        ].head(10).copy()
-        examples["Paysheet Month"] = examples["Paysheet Month"].dt.strftime("%b-%Y")
-        pairs = ", ".join(
-            f"{row[erp_col]} ({row['Paysheet Month']})"
-            for _, row in examples.iterrows()
-        )
-        raise ValueError(f"The same ERP/month was uploaded more than once: {pairs}")
-
-    combined = combined.sort_values([erp_col, "Paysheet Month"]).reset_index(drop=True)
-
-    if "First Hire Date Variance" not in combined.columns:
-        combined["First Hire Date Variance"] = False
-    if "First Hire Date Recovered" not in combined.columns:
-        combined["First Hire Date Recovered"] = False
-    if "Company Code Excluded" not in combined.columns:
-        combined["Company Code Excluded"] = False
-    if "Exceptional ERP" not in combined.columns:
-        combined["Exceptional ERP"] = False
-
+    if "Wage Month" not in combined.columns and "Paysheet Month" in combined.columns:
+        combined["Wage Month"] = combined["Paysheet Month"]
+    # If these are full-engine detail rows, rebuild a compact summary without
+    # altering the already-computed deduction values.
+    if "Deduction Amount" not in combined.columns:
+        return pd.DataFrame(), combined
+    combined["Wage Month"] = pd.to_datetime(combined["Wage Month"], errors="coerce")
     summary = combined.groupby(erp_col, dropna=False).agg(
         **{
             "First Hire Date": ("First Hire Date", "min"),
-            "First Hire Date Variance": ("First Hire Date Variance", "max"),
-            "First Hire Date Recovered": ("First Hire Date Recovered", "max"),
             "Branch": ("Branch", "last"),
             "Designation": ("Designation", "last"),
             "Company Code": ("Company Code", "last"),
             "Employment Type": ("Employment Type", "last"),
             "Retention Applicable": ("Retention Applicable", "last"),
-            "Company Code Excluded": ("Company Code Excluded", "max"),
-            "Exceptional ERP": ("Exceptional ERP", "max"),
-            "Retention Remarks": ("Retention Remarks", "last"),
-            "Final Retention Remark": ("Final Retention Remark", "last"),
-            "Months Processed": ("Paysheet Month", "nunique"),
+            "Months Processed": ("Wage Month", "nunique"),
             "Months With Deduction": ("Deduction Amount", lambda s: int((s > 0).sum())),
             "Total Deduction Accumulated": ("Deduction Amount", "sum"),
             "Latest Status": ("Status", "last"),
         }
     ).reset_index()
-
-    first_deduction = (
-        combined.loc[combined["Deduction Amount"] > 0]
-        .groupby(erp_col)["Paysheet Month"]
-        .min()
-        .rename("First Deduction Month")
-    )
-    summary = summary.merge(first_deduction, on=erp_col, how="left")
-    return summary.sort_values(erp_col).reset_index(drop=True), combined
+    summary["Deduction Count"] = summary["Months With Deduction"]
+    return summary, combined
 
 
-def _retention_group_report(combined: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    if combined is None or combined.empty or group_col not in combined.columns:
+def _retention_group_report(detail: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    if detail is None or detail.empty or group_col not in detail.columns:
         return pd.DataFrame()
-
-    work = combined.copy()
-    work[group_col] = (
-        work[group_col]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .replace("", "Unmapped")
-    )
+    work = detail.copy()
+    work[group_col] = work[group_col].fillna("").astype(str).str.strip().replace("", "Unmapped")
     return (
         work.groupby(group_col, dropna=False)
         .agg(
@@ -1356,53 +1416,38 @@ def _retention_group_report(combined: pd.DataFrame, group_col: str) -> pd.DataFr
 
 
 def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> dict:
-    """Create the complete Retention Fund reporting pack."""
-    empty_report = {
-        "ERP Summary": pd.DataFrame(),
-        "Month Wise Detail": pd.DataFrame(),
-        "Monthly Summary": pd.DataFrame(),
-        "Branch Summary": pd.DataFrame(),
-        "Designation Summary": pd.DataFrame(),
-        "Company Summary": pd.DataFrame(),
-        "Employment Type Summary": pd.DataFrame(),
-        "Retention Remarks Summary": pd.DataFrame(),
-        "Status Summary": pd.DataFrame(),
-        "Exclusion Summary": pd.DataFrame(),
-        "Pending Releases": pd.DataFrame(),
-        "Exceptions - No Deduction": pd.DataFrame(),
-        "Missing Mapping": pd.DataFrame(),
-        "First Hire Date Audit": pd.DataFrame(),
-    }
+    """Build release, hold, deduction-history and audit reports from the full book."""
+    report_names = [
+        "ERP Summary", "Full Book Detail", "Month Wise Detail", "Current Payroll",
+        "New Joiners - Current Payroll", "Eligible New Joiners - Current Payroll",
+        "Deduction History", "Release Cases", "Hold Cases", "Review Cases", "No Deduction Yet",
+        "Not Applicable", "Monthly Summary", "Branch Summary", "Designation Summary",
+        "Company Summary", "Employment Type Summary", "Status Summary", "Exclusion Summary",
+        "Pending Releases", "Exceptions - No Deduction", "Missing Mapping", "First Hire Date Audit",
+    ]
     if combined is None or combined.empty:
-        return empty_report
+        return {name: pd.DataFrame() for name in report_names}
 
     work = combined.copy()
-    work["Paysheet Month"] = pd.to_datetime(work["Paysheet Month"])
+    work["Wage Month"] = pd.to_datetime(work["Wage Month"], errors="coerce")
 
     monthly = (
-        work.groupby("Paysheet Month")
+        work.groupby("Wage Month", dropna=False)
         .agg(
             Employees=("ERP", "nunique"),
             Deduction_Employees=("Deduction Amount", lambda s: int((s > 0).sum())),
+            First_Month_Deductions=("Status", lambda s: int(s.eq("First Month Deduction").sum())),
+            Second_Month_Deductions=("Status", lambda s: int(s.eq("Second Month Deduction").sum())),
+            Final_Month_Deductions=("Status", lambda s: int(s.eq("Final Month Deduction").sum())),
             Total_Retention_Fund=("Deduction Amount", "sum"),
-            Excluded_Company_Code_Rows=("Company Code Excluded", "sum"),
-            Exceptional_ERP_Rows=("Exceptional ERP", "sum"),
-            Non_Full_Time_Rows=("Employment Type", lambda s: int(
-                s.fillna("").astype(str).str.strip().str.lower().eq("non-full time").sum()
-            )),
-            Missing_Mapping_Rows=("Employee Master Mapping Missing", "sum"),
         )
         .reset_index()
-        .sort_values("Paysheet Month")
+        .sort_values("Wage Month", na_position="last")
     )
 
     status_summary = (
         work.groupby("Status", dropna=False)
-        .agg(
-            Rows=("ERP", "size"),
-            Employees=("ERP", "nunique"),
-            Total_Retention_Fund=("Deduction Amount", "sum"),
-        )
+        .agg(Rows=("ERP", "size"), Employees=("ERP", "nunique"), Total_Retention_Fund=("Deduction Amount", "sum"))
         .reset_index()
         .sort_values(["Rows", "Status"], ascending=[False, True])
     )
@@ -1412,40 +1457,55 @@ def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> di
         "Exceptional ERP - No Deduction",
         "Non-Full Time - No Deduction",
         "Retention Not Applicable - No Deduction",
+        "Employee Master Mapping Missing",
+        "Customize Rule Missing",
     ]
     exclusion_summary = (
         work.loc[work["Status"].isin(exclusion_statuses)]
         .groupby("Status", dropna=False)
-        .agg(
-            Rows=("ERP", "size"),
-            Employees=("ERP", "nunique"),
-        )
+        .agg(Rows=("ERP", "size"), Employees=("ERP", "nunique"))
         .reset_index()
     )
 
-    pending = work.loc[work["Status"].eq("Pending Release")].copy()
-    exceptions = work.loc[~work["Status"].eq("Pending Release")].copy()
-    missing_mapping = work.loc[
-        work["Status"].isin(["Employee Master Mapping Missing", "Customize Rule Missing"])
-    ].copy()
+    release_cases = summary.loc[summary["Release Status"].eq("Release Due")].copy() if summary is not None and not summary.empty else pd.DataFrame()
+    hold_cases = summary.loc[summary["Release Status"].astype(str).str.startswith("Hold")].copy() if summary is not None and not summary.empty else pd.DataFrame()
+    review_cases = summary.loc[summary["Release Status"].astype(str).str.startswith("Review Required")].copy() if summary is not None and not summary.empty else pd.DataFrame()
+    no_deduction_yet = summary.loc[summary["Release Status"].eq("No Deduction Yet")].copy() if summary is not None and not summary.empty else pd.DataFrame()
+    not_applicable = summary.loc[summary["Release Status"].eq("Not Applicable")].copy() if summary is not None and not summary.empty else pd.DataFrame()
+    current_payroll = work.loc[work["Current Payroll Row"]].copy()
+    new_joiners = work.loc[work["New Joiner in Current Payroll"]].copy()
+    eligible_new_joiners = new_joiners.loc[new_joiners["Retention Eligible"]].copy() if not new_joiners.empty else pd.DataFrame()
+    deduction_history = work.loc[work["Deduction Occurred"]].copy()
+    missing_mapping = work.loc[work["Status"].isin(["Employee Master Mapping Missing", "Customize Rule Missing"])].copy()
     first_hire_audit = work.loc[
         work["First Hire Date Variance"].fillna(False)
         | work["First Hire Date Recovered"].fillna(False)
         | work["Status"].eq("Invalid First Hire Date")
+        | work["Status"].eq("Invalid Wage Month")
     ].copy()
+    exceptions = work.loc[work["Status"].isin(exclusion_statuses)].copy()
 
     return {
-        "ERP Summary": summary.copy(),
-        "Month Wise Detail": work,
+        "ERP Summary": summary.copy() if isinstance(summary, pd.DataFrame) else pd.DataFrame(),
+        "Full Book Detail": work,
+        "Month Wise Detail": work,  # compatibility alias
+        "Current Payroll": current_payroll,
+        "New Joiners - Current Payroll": new_joiners,
+        "Eligible New Joiners - Current Payroll": eligible_new_joiners,
+        "Deduction History": deduction_history,
+        "Release Cases": release_cases,
+        "Hold Cases": hold_cases,
+        "Review Cases": review_cases,
+        "No Deduction Yet": no_deduction_yet,
+        "Not Applicable": not_applicable,
         "Monthly Summary": monthly,
         "Branch Summary": _retention_group_report(work, "Branch"),
         "Designation Summary": _retention_group_report(work, "Designation"),
         "Company Summary": _retention_group_report(work, "Company Code"),
         "Employment Type Summary": _retention_group_report(work, "Employment Type"),
-        "Retention Remarks Summary": _retention_group_report(work, "Final Retention Remark"),
         "Status Summary": status_summary,
         "Exclusion Summary": exclusion_summary,
-        "Pending Releases": pending,
+        "Pending Releases": hold_cases,  # compatibility alias
         "Exceptions - No Deduction": exceptions,
         "Missing Mapping": missing_mapping,
         "First Hire Date Audit": first_hire_audit,
