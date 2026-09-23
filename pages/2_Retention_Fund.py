@@ -72,9 +72,8 @@ render_top_nav("Retention Fund")
 
 st.title("💰 Retention Fund")
 st.caption(
-    "Upload one Retention Full Book with Wage Month, Branch, Designation and Company Code on every row. "
-    "The system matches Branch + Company Code + Designation to the Customize Dashboard, reconstructs the "
-    "first 3 deductions using min(10% of Monthly Gross, Net Pay), then separates Release, Hold and Review cases."
+    "Upload the paysheet and click Compute Retention. The system calculates the applicable retention using "
+    "the configured rules and the paysheet Gross Salary / Net Pay values."
 )
 
 with st.expander("🔒 Data handling on this page", expanded=False):
@@ -191,11 +190,10 @@ def _clear_retention_results():
 # ======================================================================
 # Tabs
 # ======================================================================
-tab_compute, tab_customize, tab_dashboard = st.tabs(
+tab_compute, tab_customize = st.tabs(
     [
         "💰 Retention Compute",
         "🛠️ Customize Dashboard",
-        "📊 Reports & Release",
     ]
 )
 
@@ -204,74 +202,32 @@ tab_compute, tab_customize, tab_dashboard = st.tabs(
 # TAB 1 — RETENTION COMPUTE
 # ======================================================================
 with tab_compute:
-    st.markdown("### Retention Full Book Compute")
+    st.markdown("### Retention Compute")
     st.caption(
-        "One file can contain many employees and many Wage Months. Branch + Company Code + Designation "
-        "from each paysheet row are matched directly to the Customize Dashboard, then the system checks "
-        "First Hire Date and hard exclusions before reconstructing the first, second and final deductions."
+        "Upload the paysheet, then click **Compute Retention**. Gross Salary and Net Pay are used for the "
+        "retention calculation, while the other required fields apply the configured eligibility rules."
     )
 
-    customize_rules = load_customize_dashboard()
-    ignored_company_codes = load_ignored_company_codes()
-    exceptional_erps = load_exceptional_erps()
-
-    ready1, ready2, ready3 = st.columns(3)
-    ready1.metric("Customize Rules", len(customize_rules))
-    ready2.metric("Excluded Company Codes", len(ignored_company_codes))
-    ready3.metric("Exceptional ERPs", len(exceptional_erps))
-
-    if customize_rules.empty:
-        st.warning(
-            "No Customize Dashboard rules are configured. Configure eligibility before computing the Retention Full Book."
-        )
-
-    st.markdown("#### 1. Retention & Release Settings")
-    rel1, rel2, rel3 = st.columns([2, 2, 3])
-    release_days = rel1.number_input(
-        "Release after First Hire Date + days",
-        min_value=0,
-        max_value=1000,
-        value=340,
-        step=1,
-        key="retention_release_days_input",
-        help="Editable policy value. Example: use 330 or 340 days depending on the release cycle.",
-    )
-    release_review_date = rel2.date_input(
-        "Evaluate release cases as of",
-        value=date.today(),
-        key="retention_release_review_date_input",
-        help="Normally keep today's date. Change it only when you want to review release eligibility for another date.",
-    )
-    rel3.info(
-        "**Deduction:** only employment months 1, 2 and 3 are considered. "
-        "**Release Due:** 3/3 deductions completed and First Hire Date + release days has been reached. "
-        "**Hold:** 1/3, 2/3 or 3/3 deductions while the release date is still pending."
-    )
-
-    st.markdown("#### 2. Upload Single Retention Full Book")
+    st.markdown("### Upload Paysheet")
     st.caption(
-        "Required columns: **ERP | First Hire Date | Wage Month | Branch | Designation | Company Code | "
-        "Net Pay | Monthly Gross**. Wage Month may vary row by row. Branch + Company Code + Designation are "
-        "used directly to find the employee's eligibility rule in the Customize Dashboard."
+        "Upload one consolidated paysheet. Required fields are **ERP, First Hire Date, Wage Month, Branch, "
+        "Designation, Company Code, Net Pay and Monthly Gross**. Gross Salary and Net Pay are used to calculate "
+        "the retention amount; the other fields are used only to apply the configured retention rules."
     )
-    st.info(
-        "For old joiners, keep the historical Wage Month rows for their first 3 employment months in this file. "
-        "Each row must carry Branch, Designation and Company Code. The system matches those three values to the "
-        "Customize Dashboard and reconstructs the deduction count using the retention formula."
-    )
+
     sample = sample_consolidated_paysheet_template()
     with st.expander("View sample format", expanded=False):
         st.dataframe(sample, use_container_width=True, hide_index=True)
     st.download_button(
-        "⬇️ Download Full Book Sample",
+        "⬇️ Download Paysheet Sample",
         data=to_excel_bytes({"Template": sample}),
-        file_name="retention_full_book_template.xlsx",
+        file_name="retention_paysheet_template.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="download_retention_full_book_template",
     )
 
     full_book_file = st.file_uploader(
-        "Upload Retention Full Book (.xlsx / .csv)",
+        "Upload Paysheet (.xlsx / .csv)",
         type=["xlsx", "xls", "csv"],
         accept_multiple_files=False,
         key="retention_full_book_upload",
@@ -283,116 +239,63 @@ with tab_compute:
             full_book_file.seek(0)
             raw_book = read_any_table(full_book_file)
             standardized_book = standardize_retention_full_book(raw_book, full_book_file.name)
-            parsed_months = parse_wage_month_series(standardized_book["Wage Month"])
-            valid_months = parsed_months.dropna()
-
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("Rows", len(standardized_book))
-            p2.metric("ERPs", standardized_book["ERP"].astype(str).str.strip().nunique())
-            p3.metric("Wage Months", valid_months.nunique())
-            p4.metric(
-                "Current Payroll Month",
-                valid_months.max().strftime("%b-%Y") if not valid_months.empty else "Invalid / Missing",
-            )
-
-            profile_blank = (
-                standardized_book[["Branch", "Designation", "Company Code"]]
-                .fillna("").astype(str).apply(lambda c: c.str.strip()).eq("").any(axis=1)
-            )
-            unique_rule_keys = standardized_book[["Branch", "Company Code", "Designation"]].drop_duplicates()
-            q1, q2 = st.columns(2)
-            q1.metric("Unique Branch / Company / Designation Keys", len(unique_rule_keys))
-            q2.metric("Rows Missing Rule-Key Data", int(profile_blank.sum()))
-            if profile_blank.any():
-                st.warning(
-                    "Some paysheet rows are missing Branch, Designation or Company Code. Those rows will not be "
-                    "eligible for deduction until all three values are present."
-                )
-
-            with st.expander("Preview standardized full book", expanded=False):
+            with st.expander("Preview uploaded paysheet", expanded=False):
                 st.dataframe(standardized_book.head(100), use_container_width=True, hide_index=True)
         except Exception as exc:
             standardized_book = None
-            _show_error(exc, "reading the Retention Full Book")
+            _show_error(exc, "reading the Retention paysheet")
 
-    st.markdown("#### 3. Analyze & Compute")
-    if st.button("Calculate Retention Fund", type="primary", key="calculate_retention_full_book"):
+    if st.button("Compute Retention", type="primary", key="calculate_retention_full_book"):
         if standardized_book is None or standardized_book.empty:
-            st.warning("Upload a valid Retention Full Book first.")
+            st.warning("Upload a valid paysheet first.")
         else:
             try:
+                customize_rules = load_customize_dashboard()
+                ignored_company_codes = load_ignored_company_codes()
+                exceptional_erps = load_exceptional_erps()
                 summary, detail = process_retention_paysheet(
                     standardized_book,
                     exceptional_erps=exceptional_erps,
                     customize_dashboard=customize_rules,
                     employee_master=None,
                     ignored_company_codes=ignored_company_codes,
-                    release_days=int(release_days),
-                    release_review_date=release_review_date,
+                    release_days=340,
+                    release_review_date=date.today(),
                     deduction_pct=10.0,
                 )
                 reports = build_retention_reports(summary, detail)
                 st.session_state["consolidated_paysheet_summary"] = summary
                 st.session_state["consolidated_paysheet_result"] = detail
                 st.session_state["retention_reports"] = reports
-                st.session_state["retention_release_days"] = int(release_days)
-                st.session_state["retention_release_review_date"] = release_review_date
-                st.success(
-                    f"Retention analysis completed for {summary['ERP'].nunique() if not summary.empty else 0} employee(s)."
-                )
+                st.success("Retention computed successfully.")
             except Exception as exc:
                 _show_error(exc, "calculating Retention Fund")
 
     reports = st.session_state.get("retention_reports", {})
     summary = st.session_state.get("consolidated_paysheet_summary", pd.DataFrame())
-    detail = st.session_state.get("consolidated_paysheet_result", pd.DataFrame())
 
     if isinstance(summary, pd.DataFrame) and not summary.empty:
         st.divider()
-        st.markdown("### Compute Result")
-
+        st.markdown("### Download Reports")
         validation = reports.get("Deduction Validation", pd.DataFrame())
-        current_month = (
-            detail["Current Payroll Month"].dropna().max()
-            if "Current Payroll Month" in detail.columns else pd.NaT
-        )
-        total_held = float(summary.get("Total Retention Held", pd.Series(dtype=float)).sum())
-        deduction_count = int(summary.get("Deduction Count", pd.Series(dtype=int)).eq(3).sum())
+        ledger = reports.get("Retention Ledger", pd.DataFrame())
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Employees", summary["ERP"].nunique())
-        m2.metric("Current Payroll", current_month.strftime("%b-%Y") if pd.notna(current_month) else "-")
-        m3.metric("3/3 Deductions", deduction_count)
-        m4.metric("Total Retention Held", f"₹{total_held:,.2f}")
-
-        st.markdown("#### Deduction Validation")
-        st.caption(
-            "The system checks the three expected deduction months starting from each employee's First Hire Date "
-            "and clearly identifies which deduction month occurred and which month is missing."
-        )
         if isinstance(validation, pd.DataFrame) and not validation.empty:
-            st.dataframe(validation, use_container_width=True, height=430)
-        else:
-            st.info("No deduction validation records available.")
-
-        st.markdown("#### Downloads")
-        retention_ledger = reports.get("Retention Ledger", pd.DataFrame())
-        d1, d2 = st.columns(2)
-        with d1:
-            _download_report_pack(
-                reports,
+            st.download_button(
+                "⬇️ Download Deduction Validation Report",
+                data=to_excel_bytes({"Deduction Validation": validation}),
+                file_name="retention_deduction_validation.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="download_deduction_validation_report_compute",
-                label="⬇️ Download Deduction Validation Report",
             )
-        with d2:
-            if isinstance(retention_ledger, pd.DataFrame) and not retention_ledger.empty:
-                st.download_button(
-                    "⬇️ Download Retention Ledger",
-                    data=to_excel_bytes({"Retention Ledger": retention_ledger}),
-                    file_name="retention_ledger.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_retention_ledger_compute",
-                )
+        if isinstance(ledger, pd.DataFrame) and not ledger.empty:
+            st.download_button(
+                "⬇️ Download Retention Ledger",
+                data=to_excel_bytes({"Retention Ledger": ledger}),
+                file_name="retention_ledger.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_retention_ledger_compute",
+            )
 
 
 # ======================================================================
@@ -401,34 +304,29 @@ with tab_compute:
 with tab_customize:
     st.markdown("### Customize Dashboard")
     st.caption(
-        "Configure who is eligible before running Retention Fund. A deduction is allowed only when the "
-        "employee is Full Time, Retention Applicable is Yes, the Company Code is not excluded, and the ERP "
-        "is not in the Exceptional ERP list."
+        "Upload the retention eligibility master using Company Code + Designation + Eligible for Retention (Yes/No). "
+        "Retention is calculated only when the employee matches an eligible rule."
     )
 
     st.info(
-        "**No deduction** when any one of these applies: Excluded Company Code • Exceptional ERP • "
-        "Non-Full Time • Retention Applicable = No."
+        "**Retention is calculated only when Company Code + Designation matches a rule with "
+        "Eligible for Retention = Yes.** Excluded Company Codes, Exceptional ERPs and Non-Full Time "
+        "employees remain excluded."
     )
 
     # ------------------------------------------------------------------
     # 1. Rule Master — individual add + bulk add + editable table
     # ------------------------------------------------------------------
-    st.markdown("#### 1. Branch / Designation Rule Master")
+    st.markdown("#### 1. Retention Eligibility Rule Master")
     st.caption(
-        "The rule key is **Branch + Company Code + Designation**. Bulk upload needs only these three fields. "
-        "Employment Type and Retention Applicable are automatically added and can be changed from dropdowns."
+        "The rule key is **Company Code + Designation**. Bulk upload requires only **Designation, Company Code "
+        "and Eligible for Retention (Yes/No)**. The uploaded eligibility directly controls whether Retention Fund is calculated."
     )
 
     add_col, bulk_col = st.columns(2)
 
     with add_col:
         st.markdown("##### Add One Rule")
-        single_branch = st.text_input(
-            "Branch",
-            key="customize_single_branch",
-            placeholder="Example: Koramangala",
-        )
         single_designation = st.text_input(
             "Designation",
             key="customize_single_designation",
@@ -456,7 +354,7 @@ with tab_customize:
             try:
                 updated = upsert_customize_dashboard_rule(
                     existing_df=load_customize_dashboard(),
-                    branch=single_branch,
+                    branch="",
                     designation=single_designation,
                     company_code=single_company,
                     employment_type=single_employment,
@@ -472,8 +370,8 @@ with tab_customize:
     with bulk_col:
         st.markdown("##### Bulk Add Rules")
         st.caption(
-            "Upload **Branch, Designation, Company Code and Eligible for Deduction (Yes/No)**. "
-            "Employment Type is maintained separately in the editable rule table."
+            "Upload **Designation, Company Code and Eligible for Retention (Yes/No)**. "
+            "This upload directly creates/updates the retention eligibility rules."
         )
         customize_sample = sample_customize_dashboard_bulk_template()
         st.download_button(
@@ -484,36 +382,41 @@ with tab_customize:
             key="download_customize_rule_template",
         )
         customize_file = st.file_uploader(
-            "Upload Branch / Designation / Company Code / Eligible for Deduction",
+            "Upload Designation / Company Code / Eligible for Retention (Yes/No)",
             type=["xlsx", "xls", "csv"],
             key="customize_bulk_rule_upload",
         )
 
+        if customize_file is not None:
+            try:
+                customize_file.seek(0)
+                preview_rules = read_any_table(customize_file)
+                st.dataframe(preview_rules.head(100), use_container_width=True, hide_index=True)
+            except Exception as exc:
+                _show_error(exc, "previewing the Customize Dashboard upload")
+
         if customize_file is not None and st.button(
-            "Upload / Merge Rules",
+            "Upload & Save Rules",
             key="customize_merge_bulk_rules",
             type="primary",
         ):
             try:
                 customize_file.seek(0)
                 uploaded_rules = read_any_table(customize_file)
-                branch_col = auto_detect_column(uploaded_rules, ["branch"])
                 company_col = auto_detect_column(uploaded_rules, ["company code", "company", "cc"])
                 designation_col = auto_detect_column(uploaded_rules, ["designation", "role", "title"])
                 eligible_col = auto_detect_column(
                     uploaded_rules,
-                    ["eligible for deduction", "eligible for retention", "retention applicable", "eligible"],
+                    ["eligible for retention", "eligible for deduction", "retention applicable", "eligible"],
                 )
 
                 missing = []
-                if branch_col is None:
-                    missing.append("Branch")
                 if company_col is None:
                     missing.append("Company Code")
                 if designation_col is None:
                     missing.append("Designation")
                 if eligible_col is None:
-                    missing.append("Eligible for Deduction")
+                    missing.append("Eligible for Retention")
                 if missing:
                     raise ValueError(
                         f"Customize file is missing required column(s): {', '.join(missing)}"
@@ -522,7 +425,7 @@ with tab_customize:
                 merged = merge_customize_dashboard_bulk_upload(
                     existing_df=load_customize_dashboard(),
                     upload_df=uploaded_rules,
-                    branch_col=branch_col,
+                    branch_col=None,
                     cc_col=company_col,
                     designation_col=designation_col,
                     eligible_col=eligible_col,
@@ -545,14 +448,12 @@ with tab_customize:
         num_rows="dynamic",
         key="customize_rule_table_editor",
         column_order=[
-            "Branch",
             "Designation",
             "Company Code",
             "Employment Type",
             "Retention Applicable",
         ],
         column_config={
-            "Branch": st.column_config.TextColumn("Branch", required=True),
             "Designation": st.column_config.TextColumn("Designation", required=True),
             "Company Code": st.column_config.TextColumn("Company Code", required=True),
             "Employment Type": st.column_config.SelectboxColumn(
@@ -775,50 +676,4 @@ with tab_customize:
                     _clear_retention_results()
                     st.success(f"{remove_erp} removed from the Exceptional ERP list.")
                     st.rerun()
-
-# ======================================================================
-# ======================================================================
-# TAB 3 — SIMPLE DEDUCTION VALIDATION REPORT
-# ======================================================================
-with tab_dashboard:
-    st.markdown("### Deduction Validation Report")
-    st.caption(
-        "Simple payroll validation: starting from First Hire Date, the report checks the first three expected "
-        "retention months and states which deductions occurred and which month is missing."
-    )
-
-    reports = st.session_state.get("retention_reports", {})
-    validation = reports.get("Deduction Validation", pd.DataFrame())
-
-    if not isinstance(validation, pd.DataFrame) or validation.empty:
-        st.info("No deduction validation is available. Complete a Retention Fund computation first.")
-    else:
-        v1, v2, v3 = st.columns(3)
-        v1.metric("Employees Checked", len(validation))
-        v2.metric("Complete 3/3", int(validation["Deduction Progress"].eq("3/3").sum()))
-        v3.metric("Missing Deduction History", int(validation["Validation Remark"].str.contains("missing", case=False, na=False).sum()))
-
-        st.markdown("#### Previous Deduction Validation")
-        st.dataframe(validation, use_container_width=True, height=520)
-
-        st.markdown("#### Download")
-        d1, d2 = st.columns(2)
-        with d1:
-            st.download_button(
-                "⬇️ Download Deduction Validation",
-                data=to_excel_bytes({"Deduction Validation": validation}),
-                file_name="retention_deduction_validation.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="download_deduction_validation_report",
-            )
-        with d2:
-            ledger = reports.get("Retention Ledger", pd.DataFrame())
-            if isinstance(ledger, pd.DataFrame) and not ledger.empty:
-                st.download_button(
-                    "⬇️ Download Retention Ledger",
-                    data=to_excel_bytes({"Retention Ledger": ledger}),
-                    file_name="retention_ledger.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_retention_ledger_report",
-                )
 
