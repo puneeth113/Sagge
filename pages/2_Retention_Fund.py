@@ -351,95 +351,47 @@ with tab_compute:
         st.divider()
         st.markdown("### Compute Result")
 
-        current_month = detail["Current Payroll Month"].dropna().max() if "Current Payroll Month" in detail.columns else pd.NaT
-        total_held = float(summary["Total Retention Held"].sum())
-        release_cases = reports.get("Release Cases", pd.DataFrame())
-        hold_cases = reports.get("Hold Cases", pd.DataFrame())
-        review_cases = reports.get("Review Cases", pd.DataFrame())
-        new_joiners = reports.get("New Joiners - Current Payroll", pd.DataFrame())
-        current_payroll_df = reports.get("Current Payroll", pd.DataFrame())
+        validation = reports.get("Deduction Validation", pd.DataFrame())
+        current_month = (
+            detail["Current Payroll Month"].dropna().max()
+            if "Current Payroll Month" in detail.columns else pd.NaT
+        )
+        total_held = float(summary.get("Total Retention Held", pd.Series(dtype=float)).sum())
+        deduction_count = int(summary.get("Deduction Count", pd.Series(dtype=int)).eq(3).sum())
 
-        first_now = int(current_payroll_df["Status"].eq("First Month Deduction").sum()) if not current_payroll_df.empty else 0
-        second_now = int(current_payroll_df["Status"].eq("Second Month Deduction").sum()) if not current_payroll_df.empty else 0
-        final_now = int(current_payroll_df["Status"].eq("Final Month Deduction").sum()) if not current_payroll_df.empty else 0
-
-        eligible_new_joiners = reports.get("Eligible New Joiners - Current Payroll", pd.DataFrame())
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Employees", summary["ERP"].nunique())
         m2.metric("Current Payroll", current_month.strftime("%b-%Y") if pd.notna(current_month) else "-")
-        m3.metric("New Joiners", len(new_joiners))
-        m4.metric("Eligible New Joiners", len(eligible_new_joiners))
-        m5.metric("Total Retention Held", f"₹{total_held:,.2f}")
+        m3.metric("3/3 Deductions", deduction_count)
+        m4.metric("Total Retention Held", f"₹{total_held:,.2f}")
 
-        d1m, d2m, d3m, d4m, d5m, d6m = st.columns(6)
-        d1m.metric("1st Deduction", first_now)
-        d2m.metric("2nd Deduction", second_now)
-        d3m.metric("Final Deduction", final_now)
-        d4m.metric("Release Due", len(release_cases))
-        d5m.metric("Hold", len(hold_cases))
-        d6m.metric("Review", len(review_cases))
-
-        st.markdown("#### Employee Retention Summary")
-        summary_cols = [
-            "ERP", "First Hire Date", "Branch", "Designation", "Company Code",
-            "Employment Type", "Retention Eligibility", "Current Payroll Action",
-            "Current Payroll Deduction Amount", "Deduction Count", "Deduction Progress",
-            "First Month Deduction Amount", "Second Month Deduction Amount", "Final Month Deduction Amount",
-            "Total Retention Held", "Expected Release Date", "Days Until Release",
-            "Release Status", "Release / Hold Remark",
-        ]
-        st.dataframe(summary[[c for c in summary_cols if c in summary.columns]], use_container_width=True, height=430)
-
-        result_tabs = st.tabs([
-            "Current Payroll", "New Joiners", "Eligible New Joiners", "Deduction History",
-            "Release Cases", "Hold Cases", "Review Cases", "Full Book Detail"
-        ])
-        result_report_names = [
-            "Current Payroll", "New Joiners - Current Payroll", "Eligible New Joiners - Current Payroll",
-            "Deduction History", "Release Cases", "Hold Cases", "Review Cases", "Full Book Detail"
-        ]
-        for result_tab, report_name in zip(result_tabs, result_report_names):
-            with result_tab:
-                report_df = reports.get(report_name, pd.DataFrame())
-                if isinstance(report_df, pd.DataFrame) and not report_df.empty:
-                    st.dataframe(report_df, use_container_width=True, height=420)
-                else:
-                    st.info(f"No {report_name} records.")
+        st.markdown("#### Deduction Validation")
+        st.caption(
+            "The system checks the three expected deduction months starting from each employee's First Hire Date "
+            "and clearly identifies which deduction month occurred and which month is missing."
+        )
+        if isinstance(validation, pd.DataFrame) and not validation.empty:
+            st.dataframe(validation, use_container_width=True, height=430)
+        else:
+            st.info("No deduction validation records available.")
 
         st.markdown("#### Downloads")
-        d1, d2, d3, d4 = st.columns(4)
+        retention_ledger = reports.get("Retention Ledger", pd.DataFrame())
+        d1, d2 = st.columns(2)
         with d1:
             _download_report_pack(
                 reports,
-                key="download_complete_retention_report_compute",
-                label="⬇️ Complete Report Pack",
+                key="download_deduction_validation_report_compute",
+                label="⬇️ Download Deduction Validation Report",
             )
         with d2:
-            if isinstance(release_cases, pd.DataFrame) and not release_cases.empty:
+            if isinstance(retention_ledger, pd.DataFrame) and not retention_ledger.empty:
                 st.download_button(
-                    "⬇️ Release Cases",
-                    data=to_excel_bytes({"Release Cases": release_cases}),
-                    file_name="retention_release_cases.xlsx",
+                    "⬇️ Download Retention Ledger",
+                    data=to_excel_bytes({"Retention Ledger": retention_ledger}),
+                    file_name="retention_ledger.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_release_cases_compute",
-                )
-        with d3:
-            if isinstance(hold_cases, pd.DataFrame) and not hold_cases.empty:
-                st.download_button(
-                    "⬇️ Hold Cases",
-                    data=to_excel_bytes({"Hold Cases": hold_cases}),
-                    file_name="retention_hold_cases.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_hold_cases_compute",
-                )
-        with d4:
-            if isinstance(review_cases, pd.DataFrame) and not review_cases.empty:
-                st.download_button(
-                    "⬇️ Review Cases",
-                    data=to_excel_bytes({"Review Cases": review_cases}),
-                    file_name="retention_review_cases.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_review_cases_compute",
+                    key="download_retention_ledger_compute",
                 )
 
 
@@ -520,8 +472,8 @@ with tab_customize:
     with bulk_col:
         st.markdown("##### Bulk Add Rules")
         st.caption(
-            "Upload only **Branch, Company Code, Designation**. New rules automatically appear as "
-            "**Full Time / Yes** until you edit the dropdowns below. Existing rule choices are preserved."
+            "Upload **Branch, Designation, Company Code and Eligible for Deduction (Yes/No)**. "
+            "Employment Type is maintained separately in the editable rule table."
         )
         customize_sample = sample_customize_dashboard_bulk_template()
         st.download_button(
@@ -532,7 +484,7 @@ with tab_customize:
             key="download_customize_rule_template",
         )
         customize_file = st.file_uploader(
-            "Upload Branch / Company Code / Designation",
+            "Upload Branch / Designation / Company Code / Eligible for Deduction",
             type=["xlsx", "xls", "csv"],
             key="customize_bulk_rule_upload",
         )
@@ -548,6 +500,10 @@ with tab_customize:
                 branch_col = auto_detect_column(uploaded_rules, ["branch"])
                 company_col = auto_detect_column(uploaded_rules, ["company code", "company", "cc"])
                 designation_col = auto_detect_column(uploaded_rules, ["designation", "role", "title"])
+                eligible_col = auto_detect_column(
+                    uploaded_rules,
+                    ["eligible for deduction", "eligible for retention", "retention applicable", "eligible"],
+                )
 
                 missing = []
                 if branch_col is None:
@@ -556,6 +512,8 @@ with tab_customize:
                     missing.append("Company Code")
                 if designation_col is None:
                     missing.append("Designation")
+                if eligible_col is None:
+                    missing.append("Eligible for Deduction")
                 if missing:
                     raise ValueError(
                         f"Customize file is missing required column(s): {', '.join(missing)}"
@@ -567,6 +525,7 @@ with tab_customize:
                     branch_col=branch_col,
                     cc_col=company_col,
                     designation_col=designation_col,
+                    eligible_col=eligible_col,
                 )
                 save_customize_dashboard(merged)
                 _clear_retention_results()
@@ -603,10 +562,10 @@ with tab_customize:
                 help="Non-Full Time is always excluded from Retention Fund deduction.",
             ),
             "Retention Applicable": st.column_config.SelectboxColumn(
-                "Eligible for Retention",
+                "Eligible for Deduction",
                 options=RETENTION_APPLICABLE_OPTIONS,
                 required=True,
-                help="Yes/No eligibility control. Non-Full Time remains excluded even if Yes is selected.",
+                help="Yes/No deduction eligibility control. Non-Full Time remains excluded even if Yes is selected.",
             ),
         },
     )
@@ -818,121 +777,48 @@ with tab_customize:
                     st.rerun()
 
 # ======================================================================
-# TAB 3 — REPORTS & RELEASE
+# ======================================================================
+# TAB 3 — SIMPLE DEDUCTION VALIDATION REPORT
 # ======================================================================
 with tab_dashboard:
-    st.markdown("### Reports & Release Dashboard")
+    st.markdown("### Deduction Validation Report")
+    st.caption(
+        "Simple payroll validation: starting from First Hire Date, the report checks the first three expected "
+        "retention months and states which deductions occurred and which month is missing."
+    )
+
     reports = st.session_state.get("retention_reports", {})
-    summary = st.session_state.get("consolidated_paysheet_summary", pd.DataFrame())
-    detail = st.session_state.get("consolidated_paysheet_result", pd.DataFrame())
+    validation = reports.get("Deduction Validation", pd.DataFrame())
 
-    if not isinstance(summary, pd.DataFrame) or summary.empty:
-        st.info("No Retention Fund result is available. Upload the Retention Full Book and calculate it first.")
+    if not isinstance(validation, pd.DataFrame) or validation.empty:
+        st.info("No deduction validation is available. Complete a Retention Fund computation first.")
     else:
-        release_cases = reports.get("Release Cases", pd.DataFrame())
-        hold_cases = reports.get("Hold Cases", pd.DataFrame())
-        deduction_history = reports.get("Deduction History", pd.DataFrame())
-        review_cases = reports.get("Review Cases", pd.DataFrame())
-        not_applicable = reports.get("Not Applicable", pd.DataFrame())
-        current_month = detail["Current Payroll Month"].dropna().max() if "Current Payroll Month" in detail.columns else pd.NaT
+        v1, v2, v3 = st.columns(3)
+        v1.metric("Employees Checked", len(validation))
+        v2.metric("Complete 3/3", int(validation["Deduction Progress"].eq("3/3").sum()))
+        v3.metric("Missing Deduction History", int(validation["Validation Remark"].str.contains("missing", case=False, na=False).sum()))
 
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric("Employees", summary["ERP"].nunique())
-        k2.metric("Current Payroll", current_month.strftime("%b-%Y") if pd.notna(current_month) else "-")
-        k3.metric("3/3 Deductions", int(summary["Deduction Count"].eq(3).sum()))
-        k4.metric("Release Due", len(release_cases))
-        k5.metric("On Hold", len(hold_cases))
-        k6.metric("Review Required", len(review_cases))
+        st.markdown("#### Previous Deduction Validation")
+        st.dataframe(validation, use_container_width=True, height=520)
 
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Total Retention Held", f"₹{float(summary['Total Retention Held'].sum()):,.2f}")
-        a2.metric("Release Amount", f"₹{float(summary['Release Amount'].sum()):,.2f}")
-        a3.metric("Hold Amount", f"₹{float(summary['Hold Amount'].sum()):,.2f}")
-        a4.metric("Not Applicable", len(not_applicable))
-
-        st.markdown("#### Release Cases")
-        st.caption("3/3 deductions completed and First Hire Date + configured release days has been reached.")
-        if isinstance(release_cases, pd.DataFrame) and not release_cases.empty:
-            st.dataframe(release_cases, use_container_width=True, height=360)
-        else:
-            st.info("No release-due cases as of the selected review date.")
-
-        st.markdown("#### Hold Cases")
-        st.caption(
-            "Contains 1/3, 2/3 and 3/3 deduction cases where First Hire Date + configured release days has NOT yet been reached."
-        )
-        if isinstance(hold_cases, pd.DataFrame) and not hold_cases.empty:
-            st.dataframe(hold_cases, use_container_width=True, height=360)
-        else:
-            st.info("No hold cases.")
-
-        st.markdown("#### Review Cases")
-        st.caption(
-            "Release date has already been reached, but fewer than 3 deductions were reconstructed from the uploaded full book. "
-            "These cases are separated from normal Hold cases for payroll review."
-        )
-        if isinstance(review_cases, pd.DataFrame) and not review_cases.empty:
-            st.dataframe(review_cases, use_container_width=True, height=360)
-        else:
-            st.info("No review-required cases.")
-
-        monthly = reports.get("Monthly Summary", pd.DataFrame())
-        if isinstance(monthly, pd.DataFrame) and not monthly.empty:
-            st.markdown("#### Wage Month Trend")
-            chart_data = monthly.dropna(subset=["Wage Month"]).set_index("Wage Month")["Total_Retention_Fund"]
-            if not chart_data.empty:
-                st.bar_chart(chart_data)
-            st.dataframe(monthly, use_container_width=True)
-
-        report_tabs = st.tabs([
-            "ERP Summary", "Current Payroll", "Deduction History", "Review Cases", "Not Applicable",
-            "Branch", "Designation", "Company", "Employment Type", "Status", "Audit"
-        ])
-        report_names = [
-            "ERP Summary", "Current Payroll", "Deduction History", "Review Cases", "Not Applicable",
-            "Branch Summary", "Designation Summary", "Company Summary", "Employment Type Summary",
-            "Status Summary", "First Hire Date Audit"
-        ]
-        for report_tab, report_name in zip(report_tabs, report_names):
-            with report_tab:
-                report_df = reports.get(report_name, pd.DataFrame())
-                if isinstance(report_df, pd.DataFrame) and not report_df.empty:
-                    st.dataframe(report_df, use_container_width=True, height=420)
-                else:
-                    st.info(f"No data available for {report_name}.")
-
-        st.markdown("#### Download Reports")
-        dl1, dl2, dl3, dl4 = st.columns(4)
-        with dl1:
-            _download_report_pack(
-                reports,
-                key="download_complete_retention_report_analytics",
-                label="⬇️ Complete Report Pack",
+        st.markdown("#### Download")
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button(
+                "⬇️ Download Deduction Validation",
+                data=to_excel_bytes({"Deduction Validation": validation}),
+                file_name="retention_deduction_validation.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_deduction_validation_report",
             )
-        with dl2:
-            if isinstance(release_cases, pd.DataFrame) and not release_cases.empty:
+        with d2:
+            ledger = reports.get("Retention Ledger", pd.DataFrame())
+            if isinstance(ledger, pd.DataFrame) and not ledger.empty:
                 st.download_button(
-                    "⬇️ Release Cases",
-                    data=to_excel_bytes({"Release Cases": release_cases}),
-                    file_name="retention_release_cases.xlsx",
+                    "⬇️ Download Retention Ledger",
+                    data=to_excel_bytes({"Retention Ledger": ledger}),
+                    file_name="retention_ledger.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_release_cases_analytics",
+                    key="download_retention_ledger_report",
                 )
-        with dl3:
-            if isinstance(hold_cases, pd.DataFrame) and not hold_cases.empty:
-                st.download_button(
-                    "⬇️ Hold Cases",
-                    data=to_excel_bytes({"Hold Cases": hold_cases}),
-                    file_name="retention_hold_cases.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_hold_cases_analytics",
-                )
-        with dl4:
-            if isinstance(review_cases, pd.DataFrame) and not review_cases.empty:
-                st.download_button(
-                    "⬇️ Review Cases",
-                    data=to_excel_bytes({"Review Cases": review_cases}),
-                    file_name="retention_review_cases.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_review_cases_analytics",
-                )
+
