@@ -552,9 +552,21 @@ def save_customize_dashboard(df: pd.DataFrame):
 
 
 def sample_customize_dashboard_bulk_template() -> pd.DataFrame:
+    # Bulk upload controls the rule key and direct deduction eligibility.
+    # Employment Type remains editable in the rule table.
     return pd.DataFrame([
-        {"Branch": "Koramangala", "Company Code": "MAIN", "Designation": "Teacher"},
-        {"Branch": "Whitefield", "Company Code": "MAIN", "Designation": "Principal"},
+        {
+            "Branch": "Koramangala",
+            "Designation": "Teacher",
+            "Company Code": "MAIN",
+            "Eligible for Deduction": "Yes",
+        },
+        {
+            "Branch": "Whitefield",
+            "Designation": "Principal",
+            "Company Code": "MAIN",
+            "Eligible for Deduction": "No",
+        },
     ])
 
 
@@ -565,6 +577,7 @@ def merge_customize_dashboard_bulk_upload(
     branch_col: str = "Branch",
     cc_col: str = "Company Code",
     designation_col: str = "Designation",
+    eligible_col: str = None,
 ) -> pd.DataFrame:
     if upload_df is None:
         raise ValueError("Customize upload is empty.")
@@ -595,8 +608,10 @@ def merge_customize_dashboard_bulk_upload(
         employment_type = normalise_retention_employment_type(
             prior.get("Employment Type") or "Full Time"
         )
+        uploaded_eligible = row.get(eligible_col) if eligible_col and eligible_col in upload_df.columns else None
         retention_applicable = normalise_retention_applicable(
-            prior.get("Retention Applicable"), employment_type
+            uploaded_eligible if uploaded_eligible is not None and _retention_clean_text(uploaded_eligible) else prior.get("Retention Applicable"),
+            employment_type,
         )
         rows.append({
             "Branch": branch,
@@ -1422,120 +1437,129 @@ def consolidate_paysheet_months(monthly_results: list, erp_col: str = "ERP") -> 
     return summary, combined
 
 
-def _retention_group_report(detail: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    if detail is None or detail.empty or group_col not in detail.columns:
+def _build_deduction_validation_report(summary: pd.DataFrame, combined: pd.DataFrame) -> pd.DataFrame:
+    """Create the simple payroll-facing validation report.
+
+    For each ERP, validate the three expected deduction months beginning with
+    the employee's First Hire Date month and state exactly which month
+    deductions occurred and which expected month is missing.
+    """
+    if combined is None or combined.empty:
         return pd.DataFrame()
-    work = detail.copy()
-    work[group_col] = work[group_col].fillna("").astype(str).str.strip().replace("", "Unmapped")
-    return (
-        work.groupby(group_col, dropna=False)
-        .agg(
-            Employees=("ERP", "nunique"),
-            Paysheet_Rows=("ERP", "size"),
-            Deduction_Rows=("Deduction Amount", lambda s: int((s > 0).sum())),
-            Total_Retention_Fund=("Deduction Amount", "sum"),
+
+    detail = combined.copy()
+    detail["Wage Month"] = pd.to_datetime(detail["Wage Month"], errors="coerce")
+    detail["First Hire Date"] = pd.to_datetime(detail["First Hire Date"], errors="coerce")
+    detail["Deduction Amount"] = pd.to_numeric(
+        detail.get("Deduction Amount", 0), errors="coerce"
+    ).fillna(0)
+    detail["Deduction Occurred"] = detail["Deduction Amount"].gt(0)
+
+    rows = []
+    for _, group in detail.groupby("ERP", dropna=False, sort=True):
+        group = group.sort_values("Wage Month")
+        latest = group.iloc[-1]
+        first_hire_values = group["First Hire Date"].dropna()
+        first_hire = first_hire_values.min() if not first_hire_values.empty else pd.NaT
+        eligible = bool(
+            group.get("Retention Eligible", pd.Series(False, index=group.index))
+            .fillna(False).any()
         )
-        .reset_index()
-        .sort_values("Total_Retention_Fund", ascending=False)
-        .reset_index(drop=True)
-    )
+
+        base = {
+            "ERP": latest.get("ERP", ""),
+            "First Hire Date": first_hire,
+            "Branch": latest.get("Branch", ""),
+            "Designation": latest.get("Designation", ""),
+            "Company Code": latest.get("Company Code", ""),
+            "Employment Type": latest.get("Employment Type", ""),
+            "Eligible for Deduction": "Yes" if eligible else "No",
+            "Deduction Count": int(group["Deduction Occurred"].sum()),
+        }
+
+        if pd.isna(first_hire):
+            base["Deduction Progress"] = "0/3"
+            base["Validation Remark"] = (
+                "First Hire Date is missing or invalid - previous deductions cannot be validated."
+            )
+            base["First Month"] = pd.NaT
+            base["Second Month"] = pd.NaT
+            base["Final Month"] = pd.NaT
+            base["Expected Release Date"] = pd.NaT
+            rows.append(base)
+            continue
+
+        fhd_month = first_hire.to_period("M").to_timestamp()
+        expected_months = [fhd_month + pd.DateOffset(months=i) for i in range(3)]
+        occurred_months = set(
+            group.loc[
+                group["Deduction Occurred"] & group["Wage Month"].notna(),
+                "Wage Month",
+            ].dt.to_period("M").dt.to_timestamp().tolist()
+        )
+
+        if not eligible:
+            reason = str(latest.get("Eligibility Reason", "Not eligible"))
+            remark = f"Not eligible for deduction - {reason}."
+        else:
+            parts = []
+            missing = []
+            for month in expected_months:
+                label = month.strftime("%b-%Y")
+                if month in occurred_months:
+                    parts.append(f"{label} deduction occurred")
+                else:
+                    parts.append(f"{label} deduction is missing")
+                    missing.append(label)
+            remark = "; ".join(parts) + "."
+            if missing:
+                remark += f" Missing: {', '.join(missing)}."
+            else:
+                remark += " All 3 initial deductions are present."
+
+        release_values = group.get("Expected Release Date", pd.Series(dtype="datetime64[ns]")).dropna()
+        expected_release = release_values.min() if not release_values.empty else pd.NaT
+
+        base.update({
+            "Deduction Progress": f"{min(base['Deduction Count'], 3)}/3",
+            "First Month": expected_months[0],
+            "Second Month": expected_months[1],
+            "Final Month": expected_months[2],
+            "Expected Release Date": expected_release,
+            "Validation Remark": remark,
+        })
+        rows.append(base)
+
+    return pd.DataFrame(rows).sort_values("ERP").reset_index(drop=True) if rows else pd.DataFrame()
 
 
 def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> dict:
-    """Build release, hold, deduction-history and audit reports from the full book."""
-    report_names = [
-        "ERP Summary", "Full Book Detail", "Month Wise Detail", "Current Payroll",
-        "New Joiners - Current Payroll", "Eligible New Joiners - Current Payroll",
-        "Deduction History", "Release Cases", "Hold Cases", "Review Cases", "No Deduction Yet",
-        "Not Applicable", "Monthly Summary", "Branch Summary", "Designation Summary",
-        "Company Summary", "Employment Type Summary", "Status Summary", "Exclusion Summary",
-        "Pending Releases", "Exceptions - No Deduction", "Missing Mapping", "First Hire Date Audit",
-    ]
-    if combined is None or combined.empty:
-        return {name: pd.DataFrame() for name in report_names}
+    """Keep reporting intentionally simple: validation remarks + ledger."""
+    validation = _build_deduction_validation_report(summary, combined)
 
-    work = combined.copy()
-    work["Wage Month"] = pd.to_datetime(work["Wage Month"], errors="coerce")
-
-    monthly = (
-        work.groupby("Wage Month", dropna=False)
-        .agg(
-            Employees=("ERP", "nunique"),
-            Deduction_Employees=("Deduction Amount", lambda s: int((s > 0).sum())),
-            First_Month_Deductions=("Status", lambda s: int(s.eq("First Month Deduction").sum())),
-            Second_Month_Deductions=("Status", lambda s: int(s.eq("Second Month Deduction").sum())),
-            Final_Month_Deductions=("Status", lambda s: int(s.eq("Final Month Deduction").sum())),
-            Total_Retention_Fund=("Deduction Amount", "sum"),
-        )
-        .reset_index()
-        .sort_values("Wage Month", na_position="last")
-    )
-
-    status_summary = (
-        work.groupby("Status", dropna=False)
-        .agg(Rows=("ERP", "size"), Employees=("ERP", "nunique"), Total_Retention_Fund=("Deduction Amount", "sum"))
-        .reset_index()
-        .sort_values(["Rows", "Status"], ascending=[False, True])
-    )
-
-    exclusion_statuses = [
-        "Excluded Company Code - No Deduction",
-        "Exceptional ERP - No Deduction",
-        "Non-Full Time - No Deduction",
-        "Retention Not Applicable - No Deduction",
-        "Paysheet Rule Key Missing",
-        "Employee Master Mapping Missing",  # legacy status from older cached runs
-        "Customize Rule Missing",
-    ]
-    exclusion_summary = (
-        work.loc[work["Status"].isin(exclusion_statuses)]
-        .groupby("Status", dropna=False)
-        .agg(Rows=("ERP", "size"), Employees=("ERP", "nunique"))
-        .reset_index()
-    )
-
-    release_cases = summary.loc[summary["Release Status"].eq("Release Due")].copy() if summary is not None and not summary.empty else pd.DataFrame()
-    hold_cases = summary.loc[summary["Release Status"].astype(str).str.startswith("Hold")].copy() if summary is not None and not summary.empty else pd.DataFrame()
-    review_cases = summary.loc[summary["Release Status"].astype(str).str.startswith("Review Required")].copy() if summary is not None and not summary.empty else pd.DataFrame()
-    no_deduction_yet = summary.loc[summary["Release Status"].eq("No Deduction Yet")].copy() if summary is not None and not summary.empty else pd.DataFrame()
-    not_applicable = summary.loc[summary["Release Status"].eq("Not Applicable")].copy() if summary is not None and not summary.empty else pd.DataFrame()
-    current_payroll = work.loc[work["Current Payroll Row"]].copy()
-    new_joiners = work.loc[work["New Joiner in Current Payroll"]].copy()
-    eligible_new_joiners = new_joiners.loc[new_joiners["Retention Eligible"]].copy() if not new_joiners.empty else pd.DataFrame()
-    deduction_history = work.loc[work["Deduction Occurred"]].copy()
-    missing_mapping = work.loc[work["Status"].isin([
-        "Paysheet Rule Key Missing", "Employee Master Mapping Missing", "Customize Rule Missing"
-    ])].copy()
-    first_hire_audit = work.loc[
-        work["First Hire Date Variance"].fillna(False)
-        | work["First Hire Date Recovered"].fillna(False)
-        | work["Status"].eq("Invalid First Hire Date")
-        | work["Status"].eq("Invalid Wage Month")
-    ].copy()
-    exceptions = work.loc[work["Status"].isin(exclusion_statuses)].copy()
+    ledger = pd.DataFrame()
+    if combined is not None and not combined.empty:
+        work = combined.copy()
+        work["Deduction Amount"] = pd.to_numeric(
+            work.get("Deduction Amount", 0), errors="coerce"
+        ).fillna(0)
+        work = work.loc[work["Deduction Amount"].gt(0)].copy()
+        if not work.empty:
+            work = work.sort_values(["ERP", "Wage Month"])
+            work["Deduction No."] = work.groupby("ERP").cumcount() + 1
+            work["Deduction Progress"] = work["Deduction No."].apply(
+                lambda n: f"{min(int(n), 3)}/3"
+            )
+            ledger_columns = [
+                "ERP", "Wage Month", "Deduction No.", "Deduction Progress",
+                "Deduction Stage", "Deduction Amount", "First Hire Date",
+                "Expected Release Date", "Branch", "Designation", "Company Code",
+                "Employment Type", "Retention Applicable", "Status",
+            ]
+            ledger = work[[c for c in ledger_columns if c in work.columns]].reset_index(drop=True)
 
     return {
-        "ERP Summary": summary.copy() if isinstance(summary, pd.DataFrame) else pd.DataFrame(),
-        "Full Book Detail": work,
-        "Month Wise Detail": work,  # compatibility alias
-        "Current Payroll": current_payroll,
-        "New Joiners - Current Payroll": new_joiners,
-        "Eligible New Joiners - Current Payroll": eligible_new_joiners,
-        "Deduction History": deduction_history,
-        "Release Cases": release_cases,
-        "Hold Cases": hold_cases,
-        "Review Cases": review_cases,
-        "No Deduction Yet": no_deduction_yet,
-        "Not Applicable": not_applicable,
-        "Monthly Summary": monthly,
-        "Branch Summary": _retention_group_report(work, "Branch"),
-        "Designation Summary": _retention_group_report(work, "Designation"),
-        "Company Summary": _retention_group_report(work, "Company Code"),
-        "Employment Type Summary": _retention_group_report(work, "Employment Type"),
-        "Status Summary": status_summary,
-        "Exclusion Summary": exclusion_summary,
-        "Pending Releases": hold_cases,  # compatibility alias
-        "Exceptions - No Deduction": exceptions,
-        "Missing Mapping": missing_mapping,
-        "First Hire Date Audit": first_hire_audit,
+        "Deduction Validation": validation,
+        "Retention Ledger": ledger,
     }
+
