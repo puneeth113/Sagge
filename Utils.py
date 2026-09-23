@@ -310,7 +310,7 @@ _CUSTOMIZE_DASHBOARD_FILE = os.path.join(_DATA_DIR, "customize_dashboard.json")
 EMPLOYMENT_TYPE_OPTIONS = ["Full Time", "Non-Full Time"]
 RETENTION_APPLICABLE_OPTIONS = ["Yes", "No"]
 
-CUSTOMIZE_KEY_COLUMNS = ["Branch", "Company Code", "Designation"]
+CUSTOMIZE_KEY_COLUMNS = ["Company Code", "Designation"]
 CUSTOMIZE_DASHBOARD_COLUMNS = [
     "Branch",
     "Designation",
@@ -505,6 +505,12 @@ def merge_exceptional_erp_bulk_upload(
 # --------------------------------------------------------------------------
 
 def _prepare_customize_dashboard(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize Customize Dashboard rules.
+
+    Retention eligibility is controlled by Company Code + Designation.
+    Branch is retained as an optional legacy/display field so older saved
+    configuration files do not break, but it is not required for matching.
+    """
     if df is None:
         df = pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
     out = df.copy()
@@ -520,17 +526,16 @@ def _prepare_customize_dashboard(df: pd.DataFrame) -> pd.DataFrame:
         ),
         axis=1,
     )
-    valid = out["Branch"].ne("") & out["Company Code"].ne("") & out["Designation"].ne("")
+    valid = out["Company Code"].ne("") & out["Designation"].ne("")
     out = out.loc[valid, CUSTOMIZE_DASHBOARD_COLUMNS].copy()
     if out.empty:
         return pd.DataFrame(columns=CUSTOMIZE_DASHBOARD_COLUMNS)
-    out["__branch_key"] = _retention_normalise_key_series(out["Branch"])
     out["__cc_key"] = _retention_normalise_key_series(out["Company Code"])
     out["__designation_key"] = _retention_normalise_key_series(out["Designation"])
     out = out.drop_duplicates(
-        subset=["__branch_key", "__cc_key", "__designation_key"], keep="last"
+        subset=["__cc_key", "__designation_key"], keep="last"
     )
-    return out.drop(columns=["__branch_key", "__cc_key", "__designation_key"]).reset_index(drop=True)
+    return out.drop(columns=["__cc_key", "__designation_key"]).reset_index(drop=True)
 
 
 def load_customize_dashboard() -> pd.DataFrame:
@@ -552,20 +557,18 @@ def save_customize_dashboard(df: pd.DataFrame):
 
 
 def sample_customize_dashboard_bulk_template() -> pd.DataFrame:
-    # Bulk upload controls the rule key and direct deduction eligibility.
+    # Bulk upload controls Company Code + Designation + direct eligibility.
     # Employment Type remains editable in the rule table.
     return pd.DataFrame([
         {
-            "Branch": "Koramangala",
             "Designation": "Teacher",
             "Company Code": "MAIN",
-            "Eligible for Deduction": "Yes",
+            "Eligible for Retention": "Yes",
         },
         {
-            "Branch": "Whitefield",
             "Designation": "Principal",
             "Company Code": "MAIN",
-            "Eligible for Deduction": "No",
+            "Eligible for Retention": "No",
         },
     ])
 
@@ -574,23 +577,32 @@ def merge_customize_dashboard_bulk_upload(
     existing_df: pd.DataFrame,
     upload_df: pd.DataFrame,
     erp_col: str = None,
-    branch_col: str = "Branch",
+    branch_col: str = None,
     cc_col: str = "Company Code",
     designation_col: str = "Designation",
     eligible_col: str = None,
 ) -> pd.DataFrame:
-    if upload_df is None:
+    """Upload Company Code + Designation + Eligible for Retention.
+
+    Branch is intentionally optional/ignored for the bulk rule because the
+    current retention policy is driven by Company Code + Designation.
+    """
+    if upload_df is None or upload_df.empty:
         raise ValueError("Customize upload is empty.")
-    required = [branch_col, cc_col, designation_col]
+
+    required = [cc_col, designation_col]
     missing = [c for c in required if c not in upload_df.columns]
     if missing:
-        raise ValueError(f"Customize upload is missing required column(s): {', '.join(missing)}")
+        raise ValueError(
+            f"Customize upload is missing required column(s): {', '.join(missing)}"
+        )
+    if eligible_col is None or eligible_col not in upload_df.columns:
+        raise ValueError("Customize upload must contain an Eligible for Retention (Yes/No) column.")
 
     existing = _prepare_customize_dashboard(existing_df)
     existing_map = {}
     for _, row in existing.iterrows():
         key = (
-            _retention_clean_text(row["Branch"]).upper(),
             _retention_clean_text(row["Company Code"]).upper(),
             _retention_clean_text(row["Designation"]).upper(),
         )
@@ -598,23 +610,23 @@ def merge_customize_dashboard_bulk_upload(
 
     rows = []
     for _, row in upload_df.iterrows():
-        branch = _retention_clean_text(row.get(branch_col))
         company_code = _retention_clean_text(row.get(cc_col))
         designation = _retention_clean_text(row.get(designation_col))
-        if not branch or not company_code or not designation:
+        eligible = _retention_clean_text(row.get(eligible_col))
+        if not company_code or not designation:
             continue
-        key = (branch.upper(), company_code.upper(), designation.upper())
+        if eligible.lower() not in {"yes", "no", "y", "n", "true", "false", "1", "0"}:
+            raise ValueError(
+                f"Invalid Eligible for Retention value '{eligible}'. Use only Yes or No."
+            )
+        key = (company_code.upper(), designation.upper())
         prior = existing_map.get(key, {})
         employment_type = normalise_retention_employment_type(
             prior.get("Employment Type") or "Full Time"
         )
-        uploaded_eligible = row.get(eligible_col) if eligible_col and eligible_col in upload_df.columns else None
-        retention_applicable = normalise_retention_applicable(
-            uploaded_eligible if uploaded_eligible is not None and _retention_clean_text(uploaded_eligible) else prior.get("Retention Applicable"),
-            employment_type,
-        )
+        retention_applicable = normalise_retention_applicable(eligible, employment_type)
         rows.append({
-            "Branch": branch,
+            "Branch": _retention_clean_text(prior.get("Branch")),
             "Designation": designation,
             "Company Code": company_code,
             "Employment Type": employment_type,
@@ -623,12 +635,11 @@ def merge_customize_dashboard_bulk_upload(
 
     uploaded = pd.DataFrame(rows, columns=CUSTOMIZE_DASHBOARD_COLUMNS)
     if uploaded.empty:
-        return existing
+        raise ValueError("No valid rules were found in the uploaded file.")
 
     def _add_key(frame):
         frame = frame.copy()
         frame["__key"] = list(zip(
-            _retention_normalise_key_series(frame["Branch"]),
             _retention_normalise_key_series(frame["Company Code"]),
             _retention_normalise_key_series(frame["Designation"]),
         ))
@@ -654,8 +665,8 @@ def upsert_customize_dashboard_rule(
     branch = _retention_clean_text(branch)
     designation = _retention_clean_text(designation)
     company_code = _retention_clean_text(company_code)
-    if not branch or not designation or not company_code:
-        raise ValueError("Branch, Designation and Company Code are required.")
+    if not designation or not company_code:
+        raise ValueError("Designation and Company Code are required.")
     one = pd.DataFrame([{
         "Branch": branch,
         "Designation": designation,
@@ -890,7 +901,6 @@ def _attach_employee_profile(paysheet: pd.DataFrame, erp_col: str, employee_mast
 def _attach_customize_rule(out: pd.DataFrame, customize_dashboard: pd.DataFrame = None) -> pd.DataFrame:
     rules = _prepare_customize_dashboard(customize_dashboard)
     result = out.copy()
-    result["__branch_key"] = _retention_normalise_key_series(result["Branch"])
     result["__cc_key"] = _retention_normalise_key_series(result["Company Code"])
     result["__designation_key"] = _retention_normalise_key_series(result["Designation"])
 
@@ -898,23 +908,22 @@ def _attach_customize_rule(out: pd.DataFrame, customize_dashboard: pd.DataFrame 
         result["Employment Type"] = None
         result["Retention Applicable"] = None
         result["Customize Rule Matched"] = False
-        return result.drop(columns=["__branch_key", "__cc_key", "__designation_key"])
+        return result.drop(columns=["__cc_key", "__designation_key"])
 
     rules = rules.copy()
-    rules["__branch_key"] = _retention_normalise_key_series(rules["Branch"])
     rules["__cc_key"] = _retention_normalise_key_series(rules["Company Code"])
     rules["__designation_key"] = _retention_normalise_key_series(rules["Designation"])
     rules["Customize Rule Matched"] = True
     result = result.merge(
         rules[[
-            "__branch_key", "__cc_key", "__designation_key",
+            "__cc_key", "__designation_key",
             "Employment Type", "Retention Applicable", "Customize Rule Matched",
         ]],
-        on=["__branch_key", "__cc_key", "__designation_key"],
+        on=["__cc_key", "__designation_key"],
         how="left",
     )
     result["Customize Rule Matched"] = result["Customize Rule Matched"].eq(True)
-    return result.drop(columns=["__branch_key", "__cc_key", "__designation_key"])
+    return result.drop(columns=["__cc_key", "__designation_key"])
 
 
 def _retention_month_difference(wage_month: pd.Series, first_hire_date: pd.Series) -> pd.Series:
@@ -1563,3 +1572,157 @@ def build_retention_reports(summary: pd.DataFrame, combined: pd.DataFrame) -> di
         "Retention Ledger": ledger,
     }
 
+
+
+# --------------------------------------------------------------------------
+# Backward-compatible Payroll Calculator helper
+# --------------------------------------------------------------------------
+# NOTE: This function is intentionally kept outside the Retention Fund logic.
+# Older payroll pages import it directly from util.py. The retention refactor
+# previously removed it, which caused:
+#     AttributeError: module 'hr_utils' has no attribute 'compute_fulltime_payroll'
+# Keep this compatibility API so existing payroll pages continue to load.
+
+def compute_fulltime_payroll(
+    monthly_gross=None,
+    basic_salary=None,
+    hra=None,
+    other_allowances=None,
+    pf_rate=12.0,
+    esi_rate=0.75,
+    professional_tax=0.0,
+    tds=0.0,
+    lop_days=0.0,
+    working_days=30.0,
+    **kwargs,
+):
+    """Calculate a basic full-time payroll breakdown.
+
+    This is a backward-compatible utility for the existing Payroll Calculator
+    page. It does not affect Retention Fund calculations.
+
+    The function accepts either scalar values or a pandas DataFrame through
+    ``df=...``. For a DataFrame, common payroll column names are detected and
+    the calculated columns are appended to the original data.
+
+    Scalar result keys include both descriptive names and common legacy aliases
+    so existing payroll UI code can continue to read the result.
+    """
+    df = kwargs.pop("df", None)
+    if df is None and isinstance(monthly_gross, pd.DataFrame):
+        df = monthly_gross
+        monthly_gross = None
+    if df is not None:
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("df must be a pandas DataFrame.")
+        out = df.copy()
+
+        def _find_col(aliases):
+            lookup = {str(c).strip().lower(): c for c in out.columns}
+            for alias in aliases:
+                if alias.lower() in lookup:
+                    return lookup[alias.lower()]
+            for col in out.columns:
+                text = str(col).strip().lower()
+                if any(alias.lower() in text for alias in aliases):
+                    return col
+            return None
+
+        gross_col = _find_col(["monthly gross", "gross salary", "gross pay", "gross"])
+        basic_col = _find_col(["basic salary", "basic"])
+        hra_col = _find_col(["hra", "house rent allowance"])
+        allowance_col = _find_col(["other allowances", "allowances", "special allowance"])
+        lop_col = _find_col(["lop days", "lop"])
+
+        if gross_col is None:
+            raise ValueError("Payroll data must contain a Monthly Gross / Gross Salary column.")
+
+        gross = pd.to_numeric(out[gross_col], errors="coerce").fillna(0.0)
+        basic = (
+            pd.to_numeric(out[basic_col], errors="coerce").fillna(0.0)
+            if basic_col else gross * 0.50
+        )
+        hra_series = (
+            pd.to_numeric(out[hra_col], errors="coerce").fillna(0.0)
+            if hra_col else basic * 0.40
+        )
+        allowance_series = (
+            pd.to_numeric(out[allowance_col], errors="coerce").fillna(0.0)
+            if allowance_col else (gross - basic - hra_series).clip(lower=0)
+        )
+        lop_series = (
+            pd.to_numeric(out[lop_col], errors="coerce").fillna(0.0)
+            if lop_col else 0.0
+        )
+
+        divisor = float(working_days or 30.0)
+        if divisor <= 0:
+            divisor = 30.0
+        lop_amount = (gross / divisor) * lop_series
+        pf_base = basic.clip(lower=0)
+        pf_employee = pf_base * (float(pf_rate) / 100.0)
+        esi_employee = gross.clip(lower=0) * (float(esi_rate) / 100.0)
+        pt_series = float(professional_tax or 0.0)
+        tds_series = float(tds or 0.0)
+        net = gross - lop_amount - pf_employee - esi_employee - pt_series - tds_series
+
+        out["Basic Salary"] = basic
+        out["HRA"] = hra_series
+        out["Other Allowances"] = allowance_series
+        out["LOP Amount"] = lop_amount
+        out["Employee PF"] = pf_employee
+        out["Employee ESI"] = esi_employee
+        out["Professional Tax"] = pt_series
+        out["TDS"] = tds_series
+        out["Net Pay"] = net
+        out["In-Hand Salary"] = net
+        return out
+
+    # Scalar calculation -------------------------------------------------
+    if monthly_gross is None:
+        monthly_gross = kwargs.pop("gross_salary", kwargs.pop("gross", 0.0))
+    gross = float(monthly_gross or 0.0)
+
+    if basic_salary is None:
+        basic_salary = kwargs.pop("basic", gross * 0.50)
+    basic = float(basic_salary or 0.0)
+
+    if hra is None:
+        hra = kwargs.pop("house_rent_allowance", basic * 0.40)
+    hra_amount = float(hra or 0.0)
+
+    if other_allowances is None:
+        other_allowances = kwargs.pop("allowances", max(gross - basic - hra_amount, 0.0))
+    allowance_amount = float(other_allowances or 0.0)
+
+    divisor = float(working_days or 30.0)
+    if divisor <= 0:
+        divisor = 30.0
+    lop_amount = (gross / divisor) * float(lop_days or 0.0)
+    employee_pf = basic * (float(pf_rate) / 100.0)
+    employee_esi = gross * (float(esi_rate) / 100.0)
+    pt = float(professional_tax or 0.0)
+    tax = float(tds or 0.0)
+    net_pay = gross - lop_amount - employee_pf - employee_esi - pt - tax
+
+    result = {
+        "Monthly Gross": gross,
+        "Gross Salary": gross,
+        "Basic Salary": basic,
+        "Basic": basic,
+        "HRA": hra_amount,
+        "Other Allowances": allowance_amount,
+        "LOP Days": float(lop_days or 0.0),
+        "LOP Amount": lop_amount,
+        "Employee PF": employee_pf,
+        "PF": employee_pf,
+        "Employee ESI": employee_esi,
+        "ESI": employee_esi,
+        "Professional Tax": pt,
+        "TDS": tax,
+        "Total Deductions": lop_amount + employee_pf + employee_esi + pt + tax,
+        "Net Pay": net_pay,
+        "Net Salary": net_pay,
+        "In-Hand Salary": net_pay,
+    }
+    return result
